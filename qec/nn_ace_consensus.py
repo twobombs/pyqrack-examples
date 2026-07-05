@@ -8,8 +8,6 @@ import statistics
 import sys
 import time
 
-from scipy.stats import binom
-
 from collections import Counter
 
 import numpy as np
@@ -120,10 +118,6 @@ def calc_stats(ideal_probs, counts, shots):
 
     hog_prob = sum_hog_counts / shots
     xeb = numer / denom
-    # p-value of heavy output count, if method were actually 50/50 chance of guessing
-    p_val = (
-        (1 - binom.cdf(sum_hog_counts - 1, shots, 1 / 2)) if sum_hog_counts > 0 else 1
-    )
 
     return xeb, hog_prob
 
