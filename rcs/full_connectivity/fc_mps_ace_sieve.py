@@ -129,7 +129,7 @@ def bench_qrack(width, depth, sdrp=0.0, chi=None):
 
     for _ in range(depth):
         for i in lcv_range:
-            th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
+            th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             for c in qc:
                 c.u(th, ph, lm, i)
         shuffled = all_bits[:]
@@ -145,7 +145,7 @@ def bench_qrack(width, depth, sdrp=0.0, chi=None):
     rng_state = random.getstate()
     for _ in range(depth):
         for i in lcv_range:
-            th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
+            th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             mps_sim.apply_gate('U3', th, ph, lm, i)
             for c in qc:
                 c.u(th, ph, lm, i)
