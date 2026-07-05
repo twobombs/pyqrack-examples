@@ -208,7 +208,7 @@ def run_circuit(width, depth, row_len, col_len, patch, local_idx, rng_state):
         for i in range(width):
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
-            th = math.pi + 2 * th * abs(math.cos(th))
+            th = math.asin(th / math.pi)
             sim[patch[i]].u(local_idx[i], th, ph, lm)
 
         gate = gateSequence.pop(0)

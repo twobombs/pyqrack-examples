@@ -134,7 +134,7 @@ def bench_qrack(width, depth, sdrp=0.0, chi=None):
         for i in lcv_range:
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
-            th = math.pi + 2 * th * abs(math.cos(th))
+            th = math.asin(th / math.pi)
             qc.u(th, ph, lm, i)
             mps_sim.apply_gate('U3', th, ph, lm, i)
         shuffled = all_bits[:]

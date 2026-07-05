@@ -26,7 +26,7 @@ def bench_qrack(width, depth, sdrp):
         for i in lcv_range:
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
-            th = math.pi + 2 * th * abs(math.cos(th))
+            th = math.asin(th / math.pi)
             experiment.u(i, th, ph, lm)
 
         # 2-qubit couplers

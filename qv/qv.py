@@ -61,7 +61,7 @@ def bench_qrack(n, sdrp=0):
         for i in lcv_range:
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
-            th = math.pi + 2 * th * abs(math.cos(th))
+            th = math.asin(th / math.pi)
             cos0 = math.cos(th / 2)
             sin0 = math.sin(th / 2)
             u_op = [
