@@ -93,9 +93,9 @@ def bench_qrack(width, depth):
     for _ in range(depth):
         # Single-qubit gates
         for i in lcv_range:
-            th = random.uniform(0, 2 * math.pi)
-            ph = random.uniform(0, 2 * math.pi)
-            lm = random.uniform(0, 2 * math.pi)
+            th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
+            # Keep it Haar-random towards the poles:
+            th = math.pi + 2 * th * abs(math.cos(2 * th))
             experiment.u(i, th, ph, lm)
             control.u(i, th, ph, lm)
 

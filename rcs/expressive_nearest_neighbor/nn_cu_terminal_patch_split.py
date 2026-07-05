@@ -38,6 +38,8 @@ def bench_qrack(width, depth):
     for d in range(depth):
         for i in lcv_range:
             th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
+            # Keep it Haar-random towards the poles:
+            th = math.pi + 2 * th * abs(math.cos(2 * th))
             qc.u(th, ph, lm, i)
 
         gate = gateSequence.pop(0)
@@ -68,6 +70,8 @@ def bench_qrack(width, depth):
                     b1, b2 = b2, b1
 
                 th, ph, lm, gm = (random.uniform(0, 2*math.pi) for _ in range(4))
+                # Keep it Haar-random towards the poles:
+                th = math.pi + 2 * th * abs(math.cos(2 * th))
                 qc.cu(th, ph, lm, gm, b1, b2)
 
         sim = QrackSimulator(width)
