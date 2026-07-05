@@ -15,7 +15,7 @@ from qiskit.compiler import transpile
 
 
 def rand_u3(circ, q):
-    th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
+    th, ph, lm = (random.uniform(-2 * math.pi, 2 * math.pi) for _ in range(3))
     # Keep it Haar-random towards the poles:
     th = math.pi + th * abs(math.cos(th / 2))
     circ.u(th, ph, lm, q)
