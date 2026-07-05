@@ -92,7 +92,7 @@ def bench_qrack(width, depth):
         for i in lcv_range:
             th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
-            th = math.pi + 2 * th * abs(math.cos(2 * th))
+            th = math.pi + th * abs(math.cos(th / 2))
             sim.u(i, th, ph, lm)
 
         # Nearest-neighbor couplers:

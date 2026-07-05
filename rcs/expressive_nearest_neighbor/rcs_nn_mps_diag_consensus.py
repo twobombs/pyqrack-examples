@@ -315,7 +315,7 @@ def bench_qrack(width, depth, chi=None):
         for i in range(width):
             th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
-            th = math.pi + 2 * th * abs(math.cos(2 * th))
+            th = math.pi + th * abs(math.cos(th / 2))
             qc.u(th, ph, lm, i)
             mps_sim.apply_gate('U3', th, ph, lm, i)
         gate = gateSequence.pop(0); gateSequence.append(gate)
