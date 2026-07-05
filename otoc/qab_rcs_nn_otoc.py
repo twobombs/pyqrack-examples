@@ -8,11 +8,7 @@ import sys
 
 from collections import Counter
 
-from scipy.stats import binom
-
 from pyqrack import QrackAceBackend
-
-from qiskit import QuantumCircuit
 
 
 def factor_width(width):
@@ -39,21 +35,31 @@ def cz(sim, q1, q2):
 
 
 def acx(sim, q1, q2):
-    sim.x(q1)
-    sim.cx(q1, q2)
-    sim.x(q1)
+    sim.acx(q1, q2)
 
 
 def acy(sim, q1, q2):
-    sim.x(q1)
-    sim.cy(q1, q2)
-    sim.x(q1)
+    sim.acy(q1, q2)
 
 
 def acz(sim, q1, q2):
-    sim.x(q1)
-    sim.cz(q1, q2)
-    sim.x(q1)
+    sim.acz(q1, q2)
+
+
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def x(sim, q):
+    sim.x(q)
+
+
+def y(sim, q):
+    sim.y(q)
+
+
+def z(sim, q):
+    sim.z(q)
 
 
 def bench_qrack(width, depth, cycles):
@@ -68,14 +74,14 @@ def bench_qrack(width, depth, cycles):
 
     row_len, col_len = factor_width(width)
 
-    rcs = QuantumCircuit(width)
+    rcs = []
     for d in range(depth):
         # Single-qubit gates
         for i in lcv_range:
             th = random.uniform(0, 2 * math.pi)
             ph = random.uniform(0, 2 * math.pi)
             lm = random.uniform(0, 2 * math.pi)
-            rcs.u(th, ph, lm, i)
+            rcs.append((u, i, th, ph, lm))
 
         # Nearest-neighbor couplers:
         ############################
@@ -109,24 +115,31 @@ def bench_qrack(width, depth, cycles):
                     b2 = t
 
                 g = random.choice(two_bit_gates)
-                g(rcs, b1, b2)
+                rcs.append((g, b1, b2))
+
+    ircs = []
+    for tup in reversed(rcs):
+        if tup[0] == u:
+            ircs.append((u, tup[1], -tup[2], -tup[4], -tup[3]))
+        else:
+            ircs.append(tup)
 
     ops = ['I', 'X', 'Y', 'Z']
     pauli_strings = []
 
-    otoc = QuantumCircuit(width)
+    otoc = []
     for cycle in range(cycles):
-        otoc &= rcs
+        otoc = otoc + rcs
         string = []
         for b in range(width):
             string.append(random.choice(ops))
         pauli_strings.append("".join(string))
         act_string(otoc, string)
-        otoc &= rcs.inverse()
-
+        otoc = otoc + ircs
 
     experiment = QrackAceBackend(width)
-    experiment.run_qiskit_circuit(otoc)
+    for tup in otoc:
+        tup[0](experiment, *tup[1:])
 
     shots = 1 << min(9, width + 2)
     experiment_probs = dict(Counter(experiment.measure_shots(all_bits, shots)))
@@ -145,11 +158,11 @@ def act_string(otoc, string):
     for i in range(len(string)):
         match string[i]:
             case 'X':
-                otoc.x(i)
+                otoc.append((x, i))
             case 'Y':
-                otoc.y(i)
+                otoc.append((y, i))
             case 'Z':
-                otoc.z(i)
+                otoc.append((z, i))
             case _:
                 pass
 
