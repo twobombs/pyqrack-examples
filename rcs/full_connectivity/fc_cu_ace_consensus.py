@@ -56,15 +56,19 @@ def bench_qrack(width, depth, sdrp=0.0, trials=1):
 
         for _ in range(depth):
             for i in lcv_range:
-                th, ph, lm = (random.uniform(0, 2 * math.pi) for _ in range(3))
+                th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
+                # Keep it Haar-random towards the poles:
+                th = math.pi + 2 * th * abs(math.cos(2 * th))
                 for c in qc:
                     c.u(th, ph, lm, i)
             shuffled = all_bits[:]
             random.shuffle(shuffled)
             cl = []
             while len(shuffled) > 1:
-                cl.append(((shuffled.pop(), shuffled.pop()),
-                           [random.uniform(0, 2 * math.pi) for _ in range(4)]))
+                th, ph, lm, gm = (random.uniform(0, 2*math.pi) for _ in range(4))
+                # Keep it Haar-random towards the poles:
+                th = math.pi + 2 * th * abs(math.cos(2 * th))
+                cl.append(((shuffled.pop(), shuffled.pop()), [th, ph, lm, gm]))
             for c in qc:
                 random.shuffle(cl)
                 for g in cl:

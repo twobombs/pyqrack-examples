@@ -23,9 +23,12 @@ def bench_qrack(width, depth):
     for _ in range(depth):
         # Single-qubit gates
         for i in lcv_range:
-            for _ in range(2):
+            ang = (random.uniform(0, 2*math.pi) for _ in range(3))
+            # Keep it Haar-random towards the poles:
+            ang[0] = math.pi + 2 * ang[0] * abs(math.cos(2 * ang[0]))
+            for a in range(3):
                 experiment.h(i)
-                experiment.r(Pauli.PauliZ, random.uniform(0, 2 * math.pi), i)
+                experiment.r(Pauli.PauliZ, ang[a], i)
 
         # 2-qubit couplers
         unused_bits = all_bits.copy()
