@@ -2,20 +2,13 @@
 # (Are they better than the 2019 Sycamore hardware?)
 
 import math
-import os
 import random
 import statistics
 import sys
 
 from collections import Counter
 
-from scipy.stats import binom
-
 from pyqrack import QrackSimulator
-
-from qiskit import QuantumCircuit
-from qiskit_aer.backends import AerSimulator
-from qiskit.quantum_info import Statevector
 
 
 def factor_width(width):
@@ -30,43 +23,50 @@ def factor_width(width):
 
 
 def cx(sim, q1, q2):
-    sim.cx(q1, q2)
+    sim.mcx([q1], q2)
 
 
 def cy(sim, q1, q2):
-    sim.cy(q1, q2)
+    sim.mcy([q1], q2)
 
 
 def cz(sim, q1, q2):
-    sim.cz(q1, q2)
+    sim.mcz([q1], q2)
 
 
 def acx(sim, q1, q2):
-    sim.x(q1)
-    sim.cx(q1, q2)
-    sim.x(q1)
+    sim.macx([q1], q2)
 
 
 def acy(sim, q1, q2):
-    sim.x(q1)
-    sim.cy(q1, q2)
-    sim.x(q1)
+    sim.macy([q1], q2)
 
 
 def acz(sim, q1, q2):
-    sim.x(q1)
-    sim.cz(q1, q2)
-    sim.x(q1)
+    sim.macz([q1], q2)
 
 
-def bench_qrack(width, depth, cycles, is_sparse):
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def x(sim, q):
+    sim.x(q)
+
+
+def y(sim, q):
+    sim.y(q)
+
+
+def z(sim, q):
+    sim.z(q)
+
+
+def bench_qrack(width, depth, cycles):
     # This is a "nearest-neighbor" coupler random circuit.
 
     lcv_range = range(width)
     all_bits = list(lcv_range)
-    ace_qb = (width + 3) // 4
-
-    print(f"Maximum entangled subsystem qubit footprint: {ace_qb}")
 
     # Nearest-neighbor couplers:
     gateSequence = [0, 3, 2, 1, 2, 1, 0, 3]
@@ -74,14 +74,14 @@ def bench_qrack(width, depth, cycles, is_sparse):
 
     row_len, col_len = factor_width(width)
 
-    rcs = QuantumCircuit(width)
+    rcs = []
     for d in range(depth):
         # Single-qubit gates
         for i in lcv_range:
             th = random.uniform(0, 2 * math.pi)
             ph = random.uniform(0, 2 * math.pi)
             lm = random.uniform(0, 2 * math.pi)
-            rcs.u(th, ph, lm, i)
+            rcs.append((u, i, th, ph, lm))
 
         # Nearest-neighbor couplers:
         ############################
@@ -115,34 +115,40 @@ def bench_qrack(width, depth, cycles, is_sparse):
                     b2 = t
 
                 g = random.choice(two_bit_gates)
-                g(rcs, b1, b2)
+                rcs.append((g, b1, b2))
+
+    ircs = []
+    for tup in reversed(rcs):
+        if tup[0] == u:
+            ircs.append((u, tup[1], -tup[2], -tup[4], -tup[3]))
+        else:
+            ircs.append(tup)
 
     ops = ['I', 'X', 'Y', 'Z']
     pauli_strings = []
 
-    otoc = QuantumCircuit(width)
+    otoc = []
     for cycle in range(cycles):
-        otoc &= rcs
+        otoc = otoc + rcs
         string = []
         for b in range(width):
             string.append(random.choice(ops))
         pauli_strings.append("".join(string))
         act_string(otoc, string)
-        otoc &= rcs.inverse()
+        otoc = otoc + ircs
 
 
-    experiment = QrackSimulator(width, is_sparse=is_sparse)
+    ace_qb = (width + 3) >> 2
+    control = QrackSimulator(width)
+    experiment = QrackSimulator(width)
     experiment.set_ace_max_qb(ace_qb)
-    experiment.run_qiskit_circuit(otoc)
+    for tup in otoc:
+        tup[0](control, *tup[1:])
+        tup[0](experiment, *tup[1:])
 
-    otoc_aer = otoc.copy()
-    otoc_aer.save_statevector()
-    control = AerSimulator(method="statevector")
-    job = control.run(otoc_aer)
-
-    shots = 1 << (width + 2)
+    shots = 1 << min(9, width + 2)
     experiment_counts = dict(Counter(experiment.measure_shots(all_bits, shots)))
-    control_probs = Statevector(job.result().get_statevector()).probabilities()
+    control_probs = control.out_probs()
 
     return calc_stats(control_probs, experiment_counts, d + 1, shots, ace_qb), pauli_strings
 
@@ -151,11 +157,11 @@ def act_string(otoc, string):
     for i in range(len(string)):
         match string[i]:
             case 'X':
-                otoc.x(i)
+                otoc.append((x, i))
             case 'Y':
-                otoc.y(i)
+                otoc.append((y, i))
             case 'Z':
-                otoc.z(i)
+                otoc.append((z, i))
             case _:
                 pass
 
@@ -205,18 +211,15 @@ def calc_stats(ideal_probs, counts, depth, shots, ace_qb):
 def main():
     if len(sys.argv) < 4:
         raise RuntimeError(
-            "Usage: python3 fc_qiskit_validation.py [width] [depth] [cycles] [is_sparse]"
+            "Usage: python3 rcs_nn_otoc_qrack_validation.py [width] [depth] [cycles]"
         )
 
     width = int(sys.argv[1])
     depth = int(sys.argv[2])
     cycles = int(sys.argv[3])
-    is_sparse = False
-    if len(sys.argv) > 4:
-        is_sparse = sys.argv not in ['False', '0']
 
     # Run the benchmarks
-    print(bench_qrack(width, depth, cycles, is_sparse))
+    print(bench_qrack(width, depth, cycles))
 
     return 0
 
