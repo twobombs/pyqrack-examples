@@ -6,8 +6,6 @@ import statistics
 import sys
 import time
 
-from scipy.stats import binom
-
 from pyqrack import QrackSimulator
 
 from qiskit_aer import Aer
@@ -96,10 +94,6 @@ def calc_stats(ideal_probs, counts, interval, sim_interval, shots):
 
     hog_prob = sum_hog_counts / shots
     xeb = numer / denom
-    # p-value of heavy output count, if method were actually 50/50 chance of guessing
-    p_val = (
-        (1 - binom.cdf(sum_hog_counts - 1, shots, 1 / 2)) if sum_hog_counts > 0 else 1
-    )
 
     return {
         "qubits": n,
@@ -107,7 +101,6 @@ def calc_stats(ideal_probs, counts, interval, sim_interval, shots):
         "xeb": xeb,
         "hog_prob": hog_prob,
         "pass": hog_prob >= 2 / 3,
-        "p-value": p_val,
         "clops": (n * shots) / interval,
         "sim_clops": (n * shots) / sim_interval,
         "eplg": (1 - (xeb ** (1 / depth))) if xeb < 1 else 0,

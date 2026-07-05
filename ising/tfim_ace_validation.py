@@ -9,8 +9,6 @@ import sys
 
 from collections import Counter
 
-from scipy.stats import binom
-
 from qiskit import QuantumCircuit
 from qiskit.circuit.library import RZZGate
 from qiskit.compiler import transpile
@@ -112,10 +110,6 @@ def calc_stats(ideal_probs, counts, depth, shots):
     l2_difference = diff_sqr ** (1 / 2)
     hog_prob = sum_hog_counts / shots
     xeb = numer / denom
-    # p-value of heavy output count, if method were actually 50/50 chance of guessing
-    p_val = (
-        (1 - binom.cdf(sum_hog_counts - 1, shots, 1 / 2)) if sum_hog_counts > 0 else 1
-    )
 
     return {
         "qubits": n,
@@ -123,7 +117,6 @@ def calc_stats(ideal_probs, counts, depth, shots):
         "l2_difference": float(l2_difference),
         "xeb": float(xeb),
         "hog_prob": float(hog_prob),
-        "p-value": float(p_val),
     }
 
 
@@ -258,7 +251,7 @@ def main():
             sqr_magnetization += m * m * value
         magnetization /= shots
         sqr_magnetization /= shots
-        
+
         c_sqr_magnetization = 0
         for p in range(1 << n_qubits):
             perm = p

@@ -8,32 +8,27 @@ import sys
 
 from collections import Counter
 
-from scipy.stats import binom
-
 from pyqrack import QrackSimulator
-
-from qiskit import QuantumCircuit
-from qiskit_aer.backends import AerSimulator
-from qiskit.quantum_info import Statevector
 
 
 def bench_qrack(width, depth, p, sdrp):
     # This is a "nearest-neighbor" coupler random circuit.
-    control = AerSimulator(method="statevector")
-    shots = 1 << (width + 2)
+    shots = 1 << min(8, (width + 2))
 
     lcv_range = range(width)
     all_bits = list(lcv_range)
 
-    circ = QuantumCircuit(width)
+    control = QrackSimulator(width)
     experiment = QrackSimulator(width)
+    if sdrp > 0:
+        experiment.set_sdrp(sdrp)
     for d in range(depth):
         # Single-qubit gates
         for i in lcv_range:
             th = random.uniform(0, 2 * math.pi)
             ph = random.uniform(0, 2 * math.pi)
             lm = random.uniform(0, 2 * math.pi)
-            circ.u(th, ph, lm, i)
+            control.u(i, th, ph, lm)
             experiment.u(i, th, ph, lm)
 
         # 2-qubit couplers
@@ -42,23 +37,16 @@ def bench_qrack(width, depth, p, sdrp):
         while len(unused_bits) > 1:
             c = unused_bits.pop()
             t = unused_bits.pop()
-            circ.cx(c, t)
+            control.mcx([c], t)
             experiment.mcx([c], t)
 
-        # if sdrp > 0:
-        #     experiment.set_sdrp(sdrp)
-        # experiment.run_qiskit_circuit(circ)
-
         # The point is to test whether XEB survives with a TurboQuant-based compression approach
-        experiment.lossy_out_to_file("fc.svtq", p=p)
-        experiment.lossy_in_from_file("fc.svtq")
-
-        circ_aer = circ.copy()
-        circ_aer.save_statevector()
-        job = control.run(circ_aer)
+        exp_clone = experiment.clone()
+        exp_clone.lossy_out_to_file("fc.svtq", p=p)
+        exp_clone.lossy_in_from_file("fc.svtq")
 
         experiment_counts = dict(Counter(experiment.measure_shots(all_bits, shots)))
-        control_probs = Statevector(job.result().get_statevector()).probabilities()
+        control_probs = control.out_probs()
 
         print(calc_stats(control_probs, experiment_counts, d + 1, shots))
 
@@ -87,24 +75,19 @@ def calc_stats(ideal_probs, counts, depth, shots):
 
     hog_prob = sum_hog_counts / shots
     xeb = numer / denom
-    # p-value of heavy output count, if method were actually 50/50 chance of guessing
-    p_val = (
-        (1 - binom.cdf(sum_hog_counts - 1, shots, 1 / 2)) if sum_hog_counts > 0 else 1
-    )
 
     return {
         "qubits": n,
         "depth": depth,
         "xeb": float(xeb),
         "hog_prob": float(hog_prob),
-        "p-value": float(p_val),
     }
 
 
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 fc_qiskit_validation.py [width] [depth] [compression block size power] [sdrp]"
+            "Usage: python3 fc_tq_terminal_qrack_validation.py [width] [depth] [compression block size power] [sdrp]"
         )
 
     width = int(sys.argv[1])

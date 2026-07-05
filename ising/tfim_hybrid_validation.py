@@ -9,8 +9,6 @@ import sys
 
 from collections import Counter
 
-from scipy.stats import binom
-
 from qiskit import QuantumCircuit
 from qiskit.circuit.library import RZZGate
 from qiskit.compiler import transpile

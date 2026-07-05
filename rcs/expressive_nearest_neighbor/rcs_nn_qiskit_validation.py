@@ -6,9 +6,9 @@ import random
 import statistics
 import sys
 
-from collections import Counter
+# from scipy.stats import binom
 
-from scipy.stats import binom
+from collections import Counter
 
 from pyqrack import QrackSimulator
 
@@ -167,12 +167,12 @@ def bench_qrack(width, depth, trials):
             else:
                 results[d]["xeb"] += stats["xeb"]
                 results[d]["hog_prob"] += stats["hog_prob"]
-                results[d]["p-value"] *= stats["p-value"]
+                # results[d]["p-value"] *= stats["p-value"]
 
             if trial == (trials - 1):
                 results[d]["xeb"] /= trials
                 results[d]["hog_prob"] /= trials
-                results[d]["p-value"] = results[d]["p-value"] ** (1 / trials)
+                # results[d]["p-value"] = results[d]["p-value"] ** (1 / trials)
                 print(results[d])
 
 
@@ -201,9 +201,9 @@ def calc_stats(ideal_probs, counts, depth, shots, ace_qb):
     hog_prob = sum_hog_counts / shots
     xeb = numer / denom
     # p-value of heavy output count, if method were actually 50/50 chance of guessing
-    p_val = (
-        (1 - binom.cdf(sum_hog_counts - 1, shots, 1 / 2)) if sum_hog_counts > 0 else 1
-    )
+    # p_val = (
+    #     (1 - binom.cdf(sum_hog_counts - 1, shots, 1 / 2)) if sum_hog_counts > 0 else 1
+    # )
 
     return {
         "qubits": n,

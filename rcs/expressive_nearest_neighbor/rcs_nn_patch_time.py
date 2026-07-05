@@ -10,8 +10,6 @@ import statistics
 import sys
 import time
 
-from scipy.stats import binom
-
 from pyqrack import QrackSimulator
 
 
