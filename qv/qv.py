@@ -59,9 +59,9 @@ def bench_qrack(n, sdrp=0):
     for _ in lcv_range:
         # Single-qubit gates
         for i in lcv_range:
-            th = random.uniform(0, 2 * math.pi)
-            ph = random.uniform(0, 2 * math.pi)
-            lm = random.uniform(0, 2 * math.pi)
+            th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
+            # Keep it Haar-random towards the poles:
+            th = math.pi + th * abs(math.cos(th / 2))
             cos0 = math.cos(th / 2)
             sin0 = math.sin(th / 2)
             u_op = [
