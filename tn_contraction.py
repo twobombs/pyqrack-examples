@@ -140,7 +140,7 @@ def max_amplitude_beam_search(tn, phys_inds, beam_width=4):
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 fc_qiskit_validation.py [width] [depth]"
+            "Usage: python3 tn_contraction.py [width] [depth]"
         )
 
     width = int(sys.argv[1])
