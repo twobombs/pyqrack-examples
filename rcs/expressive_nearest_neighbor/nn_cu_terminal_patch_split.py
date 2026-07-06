@@ -7,7 +7,6 @@ import statistics
 import sys
 
 from pyqrack import QrackSimulator
-from qiskit import QuantumCircuit
 
 
 def factor_width(width):
@@ -33,14 +32,14 @@ def bench_qrack(width, depth):
 
     row_len, col_len = factor_width(width)
 
-    qc = QuantumCircuit(width)
+    sim = QrackSimulator(width)
 
     for d in range(depth):
         for i in lcv_range:
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
             th = math.asin(th / math.pi)
-            qc.u(th, ph, lm, i)
+            sim.u(i, th, ph, lm)
 
         gate = gateSequence.pop(0)
         gateSequence.append(gate)
@@ -72,13 +71,12 @@ def bench_qrack(width, depth):
                 th, ph, lm, gm = (random.uniform(-math.pi, math.pi) for _ in range(4))
                 # Keep it Haar-random towards the poles:
                 th = math.asin(th / math.pi)
-                qc.cu(th, ph, lm, gm, b1, b2)
+                sim.mcu([b1], b2, th, ph, lm, gm)
 
-        sim = QrackSimulator(width)
-        sim.run_qiskit_circuit(qc, shots=0)
         c = sim.out_ket()
-        sim.separate(patch)
-        e = sim.out_ket()
+        cln = sim.clone()
+        cln.separate(patch)
+        e = cln.out_ket()
 
         print(calc_stats(c, e, d + 1, ace_qb))
 
