@@ -89,7 +89,7 @@ def bench_qrack(width, depth, reverse):
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 rcs_nn_ace_time.py [width] [depth] [reverse row/column]"
+            "Usage: python3 nn_ace_time.py [width] [depth] [reverse row/column]"
         )
 
     width = int(sys.argv[1])
