@@ -8,8 +8,6 @@ from collections import Counter
 
 from pyqrack import QrackSimulator
 
-from qiskit import QuantumCircuit
-
 
 def calc_stats(ideal_probs, exp_probs):
     # For QV, we compare probabilities of (ideal) "heavy outputs."
