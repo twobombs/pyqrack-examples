@@ -27,33 +27,27 @@ def factor_width(width):
 
 
 def cx(sim, q1, q2):
-    sim.cx(q1, q2)
+    sim.mcx([q1], q2)
 
 
 def cy(sim, q1, q2):
-    sim.cy(q1, q2)
+    sim.mcy([q1], q2)
 
 
 def cz(sim, q1, q2):
-    sim.cz(q1, q2)
+    sim.mcz([q1], q2)
 
 
 def acx(sim, q1, q2):
-    sim.x(q1)
-    sim.cx(q1, q2)
-    sim.x(q1)
+    sim.macx([q1], q2)
 
 
 def acy(sim, q1, q2):
-    sim.x(q1)
-    sim.cy(q1, q2)
-    sim.x(q1)
+    sim.macy([q1], q2)
 
 
 def acz(sim, q1, q2):
-    sim.x(q1)
-    sim.cz(q1, q2)
-    sim.x(q1)
+    sim.macz([q1], q2)
 
 
 def swap(sim, q1, q2):
@@ -61,34 +55,36 @@ def swap(sim, q1, q2):
 
 
 def iswap(sim, q1, q2):
-    sim.swap(q1, q2)
-    sim.cz(q1, q2)
-    sim.s(q1)
-    sim.s(q2)
+    sim.iswap(q1, q2)
 
 
 def iiswap(sim, q1, q2):
-    sim.sdg(q2)
-    sim.sdg(q1)
-    sim.cz(q1, q2)
-    sim.swap(q1, q2)
+    sim.adjiswap(q1, q2)
 
 
 def pswap(sim, q1, q2):
-    sim.cz(q1, q2)
+    sim.mcz([q1], q2)
     sim.swap(q1, q2)
 
 
 def mswap(sim, q1, q2):
     sim.swap(q1, q2)
-    sim.cz(q1, q2)
+    sim.mcz([q1], q2)
 
 
 def nswap(sim, q1, q2):
-    sim.cz(q1, q2)
+    sim.mcz([q1], q2)
     sim.swap(q1, q2)
-    sim.cz(q1, q2)
+    sim.mcz([q1], q2)
 
+
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def run_circuit(sim, circ):
+    for g in circ:
+        g[0](sim, *g[1:])
 
 # ---------------------------------------------------------------------------
 # Statistics
@@ -138,7 +134,7 @@ def bench_qrack(width, depth, sdrp=0.0):
     # Build circuit once in Qiskit
     # -----------------------------------------------------------------------
     t_circ = time.perf_counter()
-    qc     = [QuantumCircuit(width) for _ in range(n_inst)]
+    qc     = [[] for _ in range(n_inst)]
 
     # Nearest-neighbor couplers:
     gateSequence = [0, 3, 2, 1, 2, 1, 0, 3]
@@ -154,12 +150,12 @@ def bench_qrack(width, depth, sdrp=0.0):
     for _ in range(depth):
         # Single-qubit gates
         for i in lcv_range:
-            th = random.uniform(0, 2 * math.pi)
-            ph = random.uniform(0, 2 * math.pi)
-            lm = random.uniform(0, 2 * math.pi)
-            qc[0].u(th, ph, lm, i)
-            qc[1].u(th, ph, lm, (i + offset_1) % width)
-            qc[2].u(th, ph, lm, (i + offset_2) % width)
+            th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
+            # Keep it Haar-random towards the poles:
+            th = math.asin(th / math.pi)
+            qc[0].append((u, i, th, ph, lm))
+            qc[1].append((u, (i + offset_1) % width, th, ph, lm))
+            qc[2].append((u, (i + offset_2) % width, th, ph, lm))
 
         # Nearest-neighbor couplers:
         ############################
@@ -188,15 +184,15 @@ def bench_qrack(width, depth, sdrp=0.0):
                     continue
 
                 g = random.choice(two_bit_gates)
-                g(qc[0], b1, b2)
-                g(qc[1], (b1 + offset_1) % width, (b2 + offset_1) % width)
-                g(qc[2], (b1 + offset_2) % width, (b2 + offset_2) % width)
+                qc[0].append((g, b1, b2))
+                qc[1].append((g, (b1 + offset_1) % width, (b2 + offset_1) % width))
+                qc[2].append((g, (b1 + offset_2) % width, (b2 + offset_2) % width))
 
     # -----------------------------------------------------------------------
     # Ideal ground truth
     # -----------------------------------------------------------------------
     sim_ideal = QrackSimulator(width)
-    sim_ideal.run_qiskit_circuit(qc[0], shots=0)
+    run_circuit(sim_ideal, qc[0])
     ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
     del sim_ideal
 
@@ -210,7 +206,7 @@ def bench_qrack(width, depth, sdrp=0.0):
     ace_counts = []
     for c in qc:
         sim_ace = QrackAceBackend(width)
-        sim_ace.run_qiskit_circuit(c, shots=0)
+        run_circuit(sim_ace, c)
         ace_counts.append(dict(Counter(sim_ace.measure_shots(all_bits, shots))))
     del sim_ace
 
