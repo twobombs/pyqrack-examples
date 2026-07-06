@@ -8,8 +8,6 @@ from collections import Counter
 
 from pyqrack import QrackSimulator
 
-from qiskit import QuantumCircuit
-
 
 def calc_stats(ideal_probs, exp_probs, sdrp):
     # For QV, we compare probabilities of (ideal) "heavy outputs."
@@ -55,11 +53,27 @@ def calc_stats(ideal_probs, exp_probs, sdrp):
     }
 
 
+def h(sim, n):
+    sim.h(n)
+
+
+def cp(sim, th, q, n):
+    sim.mcu([q], n, 0, th, 0)
+
+
+def cx(sim, c, t):
+    sim.mcx([c], t)
+
+
+def swap(sim, q1, q2):
+    sim.swap(q1, q2)
+
+
 def reverse(num_qubits, circ):
     start = 0
     end = num_qubits - 1
     while start < end:
-        circ.swap(start, end)
+        circ.append((swap, start, end))
         start += 1
         end -= 1
 
@@ -71,33 +85,38 @@ def qft(n, circuit):
         return circuit
     n -= 1
 
-    circuit.h(n)
+    circuit.append((h, n))
     for qubit in range(n):
-        circuit.cp(math.pi / 2 ** (n - qubit), qubit, n)
+        circuit.append((cp, math.pi / 2 ** (n - qubit), qubit, n))
 
     # Recursive QFT is very similiar to a ("classical") FFT
     qft(n, circuit)
 
 
+def run_circuit(sim, circ):
+    for g in circ:
+        g[0](sim, *(g[1:]))
+
+
 def bench_qrack(n, sdrp):
-    circ = QuantumCircuit(n)
+    circ = []
 
     # GHZ state
-    circ.h(0)
+    circ.append((h, 0))
     for i in range(1, n):
-        circ.cx(i - 1, i)
+        circ.append((cx, i - 1, i))
 
     qft(n, circ)
     reverse(n, circ)
 
     control = QrackSimulator(n)
-    control.run_qiskit_circuit(circ, shots=0)
+    run_circuit(control, circ)
     control = control.out_probs()
 
     experiment = QrackSimulator(n)
     if sdrp > 0:
         experiment.set_sdrp(sdrp)
-    experiment.run_qiskit_circuit(circ, shots=0)
+    run_circuit(experiment, circ)
     experiment = experiment.out_probs()
 
     return calc_stats(control, experiment, sdrp)
