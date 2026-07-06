@@ -8,7 +8,6 @@ import sys
 import time
 
 import numpy as np
-from qiskit import QuantumCircuit
 from pyqrack import QrackSimulator
 
 
@@ -42,6 +41,23 @@ def calc_stats(ideal_probs, exp_probs, n_pow):
 
 
 # ---------------------------------------------------------------------------
+# Global Gate API
+# ---------------------------------------------------------------------------
+
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def cu(sim, b1, b2, th, ph, lm, gm):
+    sim.mcu([b1], b2, th, ph, lm, gm)
+
+
+def run_circuit(sim, circ):
+    for g in circ:
+        g[0](sim, *g[1:])
+
+
+# ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
 
@@ -55,7 +71,7 @@ def bench_qrack(width, depth, sdrp=0.0, p=6):
     # Build circuit once in Qiskit
     # -----------------------------------------------------------------------
     t_circ = time.perf_counter()
-    qc     = QuantumCircuit(width)
+    qc     = []
 
     # Nearest-neighbor couplers:
     gateSequence = [0, 3, 2, 1, 2, 1, 0, 3]
@@ -66,7 +82,7 @@ def bench_qrack(width, depth, sdrp=0.0, p=6):
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
             th = math.asin(th / math.pi)
-            qc.u(th, ph, lm, i)
+            qc.append((u, i, th, ph, lm))
 
         gate = gateSequence.pop(0)
         gateSequence.append(gate)
@@ -92,14 +108,16 @@ def bench_qrack(width, depth, sdrp=0.0, p=6):
                 if (b1 >= width) or (b2 >= width):
                     continue
 
-                th, ph, lm, gm = (random.uniform(0, 2*math.pi) for _ in range(4))
-                qc.cu(th, ph, lm, gm, b1, b2)
+                th, ph, lm, gm = (random.uniform(-math.pi, math.pi) for _ in range(4))
+                # Keep it Haar-random towards the poles:
+                th = math.asin(th / math.pi)
+                qc.append((cu, b1, b2, th, ph, lm, gm))
 
     # -----------------------------------------------------------------------
     # Ideal ground truth
     # -----------------------------------------------------------------------
     sim_ideal = QrackSimulator(width)
-    sim_ideal.run_qiskit_circuit(qc, shots=0)
+    run_circuit(sim_ideal, qc)
     ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
     del sim_ideal
 
@@ -114,7 +132,7 @@ def bench_qrack(width, depth, sdrp=0.0, p=6):
     if sdrp > 0.0:
         sim.set_sdrp(sdrp)
     sim.set_ace_max_qb((width + 1) >> 1)
-    sim.run_qiskit_circuit(qc, shots=0)
+    run_circuit(sim, qc)
 
     sim.lossy_out_to_file("nn.svtq", p=p)
     sim.lossy_in_from_file("nn.svtq")
