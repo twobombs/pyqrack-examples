@@ -207,7 +207,7 @@ def calc_stats(ideal_probs, counts, depth, shots):
 def main():
     if len(sys.argv) < 4:
         raise RuntimeError(
-            "Usage: python3 fc_qiskit_validation.py [width] [depth] [cycles]"
+            "Usage: python3 qab_rcs_nn_otoc_qrack_validation.py [width] [depth] [cycles]"
         )
 
     width = int(sys.argv[1])
