@@ -8,7 +8,6 @@ import sys
 import time
 
 import numpy as np
-from qiskit import QuantumCircuit
 from pyqrack import QrackSimulator
 
 
@@ -39,6 +38,23 @@ def calc_stats(ideal_probs, exp_probs, n_pow):
     xeb   = float(np.dot(p_c, q_c)) / denom if denom > 0 else 0.0
     hog   = float(exp_probs[ideal_probs > float(np.median(ideal_probs))].sum())
     return xeb, hog
+
+
+# ---------------------------------------------------------------------------
+# Global Gate API
+# ---------------------------------------------------------------------------
+
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def cu(sim, c, t, th, ph, lm, gm):
+    sim.mcu([c], t, th, ph, lm, gm)
+
+
+def run_circuit(sim, circ):
+    for g in circ:
+        g[0](sim, *g[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +92,13 @@ def bench_qrack(width, depth, sdrp=0.0, trials=1):
         # different coupler orderings — identical to fc_ace_consensus.py)
         # -----------------------------------------------------------------------
         t_circ = time.perf_counter()
-        qc = [QuantumCircuit(width) for _ in range(n_inst)]
+        qc = [[] for _ in range(n_inst)]
 
         for _ in range(depth):
             for i in lcv_range:
                 th, ph, lm = (random.uniform(0, 2*math.pi) for _ in range(3))
                 for c in qc:
-                    c.u(th, ph, lm, i)
+                    c.append((u, i, th, ph, lm))
 
             gate = gateSequence.pop(0)
             gateSequence.append(gate)
@@ -118,7 +134,7 @@ def bench_qrack(width, depth, sdrp=0.0, trials=1):
                 random.shuffle(cl)
                 for g in cl:
                     b, p = g
-                    c.cu(p[0], p[1], p[2], p[3], b[0], b[1])
+                    c.append((cu, b[0], b[1], p[0], p[1], p[2], p[3]))
 
         t_build = time.perf_counter()
         if trials == 1:
@@ -128,7 +144,7 @@ def bench_qrack(width, depth, sdrp=0.0, trials=1):
         # Ideal ground truth (full state vector via Qrack)
         # -----------------------------------------------------------------------
         sim_ideal = QrackSimulator(width)
-        sim_ideal.run_qiskit_circuit(qc[0], shots=0)
+        run_circuit(sim_ideal, qc[0])
         ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
         del sim_ideal
 
@@ -145,7 +161,7 @@ def bench_qrack(width, depth, sdrp=0.0, trials=1):
             sim = QrackSimulator(width, is_binary_decision_tree=True)
             if sdrp > 0.0:
                 sim.set_sdrp(sdrp)
-            sim.run_qiskit_circuit(qc[inst], shots=0)
+            run_circuit(sim, qc[inst])
             ace_sims.append(sim)
 
         t_ace = time.perf_counter()
