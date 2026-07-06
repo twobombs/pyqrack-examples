@@ -11,7 +11,6 @@ import time
 from collections import Counter
 
 import numpy as np
-from qiskit import QuantumCircuit
 from pyqrack import QrackSimulator, QrackAceBackend
 
 
