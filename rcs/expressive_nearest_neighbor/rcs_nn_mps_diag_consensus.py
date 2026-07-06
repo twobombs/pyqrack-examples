@@ -30,7 +30,6 @@ from collections import defaultdict
 import numpy as np
 import jax.numpy as jnp
 import quimb.tensor as tn
-from qiskit import QuantumCircuit
 from pyqrack import QrackSimulator
 
 
@@ -158,6 +157,38 @@ def nswap(sim,q1,q2,p,l):
         sim[pp].mcz([l1],l2); sim[pp].swap(l1,l2); sim[pp].mcz([l1],l2)
 
 TWO_BIT_GATES = swap,pswap,mswap,nswap,iswap,iiswap,cx,cy,cz,acx,acy,acz
+
+
+def _cx(sim, q1, q2):
+    sim.mcx([q1], q2)
+
+
+def _cy(sim, q1, q2):
+    sim.mcy([q1], q2)
+
+
+def _cz(sim, q1, q2):
+    sim.mcz([q1], q2)
+
+
+def _swap(sim, q1, q2):
+    sim.swap(q1, q2)
+
+
+def _iswap(sim, q1, q2):
+    sim.iswap(q1, q2)
+
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def x(sim, q):
+    sim.x(q)
+
+
+def run_circuit(sim, circ):
+    for g in circ:
+        g[0](sim, *g[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -313,10 +344,10 @@ def bench_qrack(width, depth, chi=None):
     gateSequence = gateSequence0.copy()
     for _ in range(depth):
         for i in range(width):
-            th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
+            th, ph, lm = (random.uniform(-math.pi,math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
             th = math.asin(th / math.pi)
-            qc.u(th, ph, lm, i)
+            qc.append((u, i, th, ph, lm))
             mps_sim.apply_gate('U3', th, ph, lm, i)
         gate = gateSequence.pop(0); gateSequence.append(gate)
         for row in range(1, row_len, 2):
@@ -332,18 +363,18 @@ def bench_qrack(width, depth, chi=None):
                                         'iiswap','pswap','mswap','nswap',
                                         'acx','acy','acz'])
                 # Apply to Qiskit circuit
-                if g_name == 'cx':      qc.cx(b1,b2)
-                elif g_name == 'cy':    qc.cy(b1,b2)
-                elif g_name == 'cz':    qc.cz(b1,b2)
-                elif g_name == 'swap':  qc.swap(b1,b2)
-                elif g_name == 'iswap': qc.iswap(b1,b2)
-                elif g_name == 'iiswap':qc.iswap(b2,b1)
-                elif g_name == 'pswap': qc.cz(b1,b2); qc.swap(b1,b2)
-                elif g_name == 'mswap': qc.swap(b1,b2); qc.cz(b1,b2)
-                elif g_name == 'nswap': qc.cz(b1,b2); qc.swap(b1,b2); qc.cz(b1,b2)
-                elif g_name == 'acx':   qc.x(b1); qc.cx(b1,b2); qc.x(b1)
-                elif g_name == 'acy':   qc.x(b1); qc.cy(b1,b2); qc.x(b1)
-                elif g_name == 'acz':   qc.x(b1); qc.cz(b1,b2); qc.x(b1)
+                if g_name == 'cx':      qc.append((_cx,b1,b2))
+                elif g_name == 'cy':    qc.append((_cy,b1,b2))
+                elif g_name == 'cz':    qc.append((_cz,b1,b2))
+                elif g_name == 'swap':  qc.append((_swap,b1,b2))
+                elif g_name == 'iswap': qc.append((_iswap,b1,b2))
+                elif g_name == 'iiswap':qc.append((_iswap,b2,b1))
+                elif g_name == 'pswap': qc.append((_cz,b1,b2)); qc.append((_swap,b1,b2))
+                elif g_name == 'mswap': qc.append((_swap,b1,b2)); qc.append((_cz,b1,b2))
+                elif g_name == 'nswap': qc.append((_cz,b1,b2)); qc.append((_swap,b1,b2)); qc.append((_cz,b1,b2))
+                elif g_name == 'acx':   qc.append((x,b1)); qc.append((_cx,b1,b2)); qc.append((x,b1))
+                elif g_name == 'acy':   qc.append((x,b1)); qc.append((_cy,b1,b2)); qc.append((x,b1))
+                elif g_name == 'acz':   qc.append((x,b1)); qc.append((_cz,b1,b2)); qc.append((x,b1))
                 # Apply to MPS
                 if g_name == 'cx':      mps_sim.apply_gate('CX',b1,b2)
                 elif g_name == 'cy':    mps_sim.apply_gate('CY',b1,b2)
@@ -391,7 +422,7 @@ def bench_qrack(width, depth, chi=None):
     # -----------------------------------------------------------------------
     sim_ideal = QrackSimulator(width)
     random.setstate(rng_state)
-    sim_ideal.run_qiskit_circuit(qc, shots=0)
+    run_circuit(sim_ideal, qc)
     ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
     del sim_ideal
 
