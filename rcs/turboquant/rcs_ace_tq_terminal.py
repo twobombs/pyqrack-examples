@@ -7,8 +7,6 @@ import sys
 
 from pyqrack import QrackSimulator
 
-from qiskit import QuantumCircuit
-
 
 def factor_width(width):
     col_len = math.floor(math.sqrt(width))
@@ -133,7 +131,7 @@ def bench_qrack(width, depth, p, sdrp):
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 fc_qiskit_validation.py [width] [depth] [compression block size power] [sdrp]"
+            "Usage: python3 rcs_ace_tq_terminal.py [width] [depth] [compression block size power] [sdrp]"
         )
 
     width = int(sys.argv[1])

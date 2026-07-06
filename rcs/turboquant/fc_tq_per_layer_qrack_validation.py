@@ -38,10 +38,6 @@ def bench_qrack(width, depth, p, sdrp):
             control.mcx([c], t)
             experiment.mcx([c], t)
 
-        # if sdrp > 0:
-        #     experiment.set_sdrp(sdrp)
-        # experiment.run_qiskit_circuit(circ)
-
         # The point is to test whether XEB survives with a TurboQuant-based compression approach
         control_probs = control.out_probs()
         experiment.lossy_out_to_file("fc.svtq", p=p)
@@ -87,7 +83,7 @@ def calc_stats(ideal_probs, counts, depth, shots):
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 fc_qiskit_validation.py [width] [depth] [compression block size power] [sdrp]"
+            "Usage: python3 fc_tq_per_layer_qrack_validation.py [width] [depth] [compression block size power] [sdrp]"
         )
 
     width = int(sys.argv[1])
