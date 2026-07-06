@@ -19,7 +19,6 @@ from collections import defaultdict
 import numpy as np
 import jax.numpy as jnp
 import quimb.tensor as tn
-from qiskit import QuantumCircuit
 from pyqrack import QrackSimulator
 
 
@@ -111,6 +110,27 @@ def route_heavy_light(prob_dict, u_u):
     return (heavy, light)
 
 
+# ---------------------------------------------------------------------------
+# Global Gate API
+# ---------------------------------------------------------------------------
+
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def cx(sim, b1, b2):
+    sim.mcx([b1], b2)
+
+
+def run_circuit(sim, circ):
+    for g in circ:
+        g[0](sim, *g[1:])
+
+
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+
 def bench_qrack(width, depth, sdrp=0.0, chi=None):
     lcv_range    = range(width)
     all_bits     = list(lcv_range)
@@ -126,7 +146,7 @@ def bench_qrack(width, depth, sdrp=0.0, chi=None):
     # Build circuit once in Qiskit + quimb MPS from same RNG
     # -----------------------------------------------------------------------
     t_circ = time.perf_counter()
-    qc      = QuantumCircuit(width)
+    qc      = []
     mps_sim = tn.CircuitMPS(width, max_bond=chi, to_backend=jnp.array)
 
     rng_state = random.getstate()
@@ -135,13 +155,13 @@ def bench_qrack(width, depth, sdrp=0.0, chi=None):
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
             th = math.asin(th / math.pi)
-            qc.u(th, ph, lm, i)
+            qc.append((u, i, th, ph, lm))
             mps_sim.apply_gate('U3', th, ph, lm, i)
         shuffled = all_bits[:]
         random.shuffle(shuffled)
         while len(shuffled) > 1:
             c, t = shuffled.pop(), shuffled.pop()
-            qc.cx(c, t)
+            qc.append((cx, c, t))
             mps_sim.apply_gate('CX', c, t)
 
     t_ideal = time.perf_counter()
@@ -153,7 +173,7 @@ def bench_qrack(width, depth, sdrp=0.0, chi=None):
     # -----------------------------------------------------------------------
     sim_ideal = QrackSimulator(width)
     random.setstate(rng_state)
-    sim_ideal.run_qiskit_circuit(qc, shots=0)
+    run_circuit(sim_ideal, qc)
     ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
     del sim_ideal
 
