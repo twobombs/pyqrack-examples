@@ -8,26 +8,9 @@ import numpy as np
 
 from pyqrack import QrackSimulator
 
-from qiskit import QuantumCircuit
-
-
-def rand_u3(sim, q):
-    th = random.uniform(0, 2 * math.pi)
-    ph = random.uniform(0, 2 * math.pi)
-    lm = random.uniform(0, 2 * math.pi)
-    sim.u(th, ph, lm, q)
-
-
-def coupler(sim, q1, q2):
-    sim.h(q2)
-    sim.cz(q1, q2)
-    sim.h(q2)
-
 
 def bench_qrack(width, depth):
     # This is a "nearest-neighbor" coupler random circuit.
-    circ = QuantumCircuit(width)
-
     lcv_range = range(width)
     all_bits = list(lcv_range)
 
@@ -39,10 +22,16 @@ def bench_qrack(width, depth):
         print("(Prime - skipped)")
         return
 
+    control = QrackSimulator(width, is_binary_decision_tree=False)
+    experiment = QrackSimulator(width, is_binary_decision_tree=True)
     for d in range(depth):
         # Single-qubit gates
         for i in lcv_range:
-            rand_u3(circ, i)
+            th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
+            # Keep it Haar-random towards the poles:
+            th = math.asin(th / math.pi)
+            control.u(i, th, ph, lm)
+            experiment.u(i, th, ph, lm)
 
         # 2-qubit couplers
         unused_bits = all_bits.copy()
@@ -50,29 +39,21 @@ def bench_qrack(width, depth):
         while len(unused_bits) > 1:
             c = unused_bits.pop()
             t = unused_bits.pop()
-            coupler(circ, c, t)
+            control.mcx([c], t)
+            experiment.mcx([c], t)
 
-        gate_count = sum(dict(circ.count_ops()).values())
-
-        experiment = QrackSimulator(width, is_binary_decision_tree=True)
-        experiment.run_qiskit_circuit(circ, shots=0)
-        experiment = experiment.out_ket()
-        control = QrackSimulator(width, is_binary_decision_tree=False)
-        control.run_qiskit_circuit(circ, shots=0)
-        control = control.out_ket()
+        experiment_ket = experiment.out_ket()
+        control_ket = control.out_ket()
 
         overall_fidelity = np.abs(
-            sum([np.conj(x) * y for x, y in zip(experiment, control)])
+            sum([np.conj(x) * y for x, y in zip(experiment_ket, control_ket)])
         )
-        per_gate_fidelity = overall_fidelity ** (1 / gate_count)
 
         print(
             "Depth="
             + str(d + 1)
             + ", overall fidelity="
             + str(overall_fidelity)
-            + ", per-gate fidelity avg.="
-            + str(per_gate_fidelity)
         )
 
 
