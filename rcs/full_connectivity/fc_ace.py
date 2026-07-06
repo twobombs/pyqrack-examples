@@ -8,7 +8,6 @@ import sys
 import time
 
 import numpy as np
-from qiskit import QuantumCircuit
 from pyqrack import QrackSimulator
 
 
@@ -29,6 +28,23 @@ def calc_stats(ideal_probs, exp_probs, n_pow):
 
 
 # ---------------------------------------------------------------------------
+# Global Gate API
+# ---------------------------------------------------------------------------
+
+def u(sim, q, th, ph, lm):
+    sim.u(q, th, ph, lm)
+
+
+def cx(sim, b1, b2):
+    sim.mcx([b1], b2)
+
+
+def run_circuit(sim, circ):
+    for g in circ:
+        g[0](sim, *g[1:])
+
+
+# ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
 
@@ -42,25 +58,25 @@ def bench_qrack(width, depth, sdrp=0.0):
     # Build circuit once in Qiskit
     # -----------------------------------------------------------------------
     t_circ = time.perf_counter()
-    qc     = QuantumCircuit(width)
+    qc     = []
 
     for _ in range(depth):
         for i in lcv_range:
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
             th = math.asin(th / math.pi)
-            qc.u(th, ph, lm, i)
+            qc.append((u, i, th, ph, lm))
         shuffled = all_bits[:]
         random.shuffle(shuffled)
         while len(shuffled) > 1:
             c, t = shuffled.pop(), shuffled.pop()
-            qc.cx(c, t)
+            qc.append((cx, c, t))
 
     # -----------------------------------------------------------------------
     # Ideal ground truth
     # -----------------------------------------------------------------------
     sim_ideal = QrackSimulator(width)
-    sim_ideal.run_qiskit_circuit(qc, shots=0)
+    run_circuit(sim_ideal, qc)
     ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
     del sim_ideal
 
@@ -78,7 +94,7 @@ def bench_qrack(width, depth, sdrp=0.0):
     if sdrp > 0.0:
         sim.set_sdrp(sdrp)
     sim.set_ace_max_qb((width + 1) >> 1)
-    sim.run_qiskit_circuit(qc, shots=0)
+    run_circuit(sim, qc)
 
     q_bits = list(range(width))
     ace_probs = np.empty(n_pow, dtype=np.float64)
