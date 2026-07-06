@@ -170,7 +170,7 @@ def calc_stats(ideal_ket, split_ket, depth, ace_qb):
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 fc_qiskit_validation.py [width] [depth]"
+            "Usage: python3 rcs_nn_qrack_validation.py [width] [depth]"
         )
 
     width = int(sys.argv[1])
