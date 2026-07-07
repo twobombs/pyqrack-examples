@@ -68,8 +68,6 @@ def bench_qrack(width, depth):
             c, t = shuffled.pop(), shuffled.pop()
             qc.cx(c, t)
 
-    qc.measure(all_bits, all_bits)
-
     # -----------------------------------------------------------------------
     # Method: Qiskit provider QrackAceBackend
     # Pass target= directly to avoid any legacy basis-gate / noise-model
@@ -78,9 +76,11 @@ def bench_qrack(width, depth):
     sim = AceQasmSimulator(n_qubits=width)
 
     # transpile against the backend's Target explicitly
-    qc_t = transpile(qc, target=sim.target, optimization_level=1)
+    qc = transpile(qc, target=sim.target, optimization_level=1)
+    qcm = qc.copy()
+    qcm.measure(all_bits, all_bits)
 
-    job = sim.run(qc_t, shots=shots)
+    job = sim.run(qcm, shots=shots)
     raw_counts = job.result().get_counts()
 
     # get_counts() returns {'bitstring': count} keyed by binary strings.
@@ -94,7 +94,7 @@ def bench_qrack(width, depth):
     # Ideal ground truth via QrackSimulator
     # -----------------------------------------------------------------------
     sim_ideal = QrackSimulator(width)
-    sim_ideal.run_qiskit_circuit(qc_t, shots=0)
+    sim_ideal.run_qiskit_circuit(qc, shots=0)
     ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
     del sim_ideal
 
