@@ -1,6 +1,3 @@
-# How good are Google's own "patch circuits" and "elided circuits" as a direct XEB approximation to full Sycamore circuits?
-# (Are they better than the 2019 Sycamore hardware?)
-
 import math
 import random
 import sys
