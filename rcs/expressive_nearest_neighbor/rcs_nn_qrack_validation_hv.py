@@ -32,13 +32,14 @@ from pyqrack import QrackSimulator
 # ---------------------------------------------------------------------------
 
 def factor_width(width):
-    row_len = math.floor(math.sqrt(width))
-    while ((width // row_len) * row_len) != width:
-        row_len -= 1
-    col_len = width // row_len
-    if row_len == 1:
+    col_len = math.floor(math.sqrt(width))
+    while ((width // col_len) * col_len) != width:
+        col_len -= 1
+    row_len = width // col_len
+    if col_len == 1:
         raise Exception("ERROR: Can't simulate prime number width!")
-    return row_len, col_len
+
+    return (row_len, col_len)
 
 
 def make_patches(width, row_len, col_len, axis):
@@ -222,8 +223,8 @@ def run_circuit(width, depth, row_len, col_len, patch, local_idx, rng_state):
                 if temp_col < 0:        temp_col += col_len
                 if temp_row >= row_len: temp_row -= row_len
                 if temp_col >= col_len: temp_col -= col_len
-                b1 = row * row_len + col
-                b2 = temp_row * row_len + temp_col
+                b1 = col * row_len + row
+                b2 = temp_col * row_len + temp_row
                 if (b1 == b2) or (b1 >= width) or (b2 >= width):
                     continue
                 g = random.choice(TWO_BIT_GATES)
