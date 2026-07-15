@@ -2,22 +2,28 @@
 # 27-Qubit 3x3x3 Macroscopic Grid RCS-OTOC Benchmark (27 Patches, 729 Qubits Total)
 # Nearest-Neighbor Coupler RCS + OTOC Echo Cycles + ACE-vs-Exact Validation
 #
-# REVISION 92 - PHYSICS & PERFORMANCE ANNOTATIONS
-# (Codifies periodic coupler semantics, multi-cycle OTOC structures, and CPU bottlenecks)
+# REVISION 96 - FIX IN-PLACE MUTATION CORRUPTION
 #
-# CHANGES (Rev 92):
-# - PHYSICS DOCS: Explicitly annotated the 8-layer periodic periodicity of the 
-#   Sycamore-style nearest-neighbor gateSequence, and the sequential, interleaved 
-#   multi-cycle OTOC scrambling semantics.
-# - PERFORMANCE DOCS: Flagged the np.median() call in calc_stats as a major CPU 
-#   memory-bandwidth bottleneck due to the O(N) partition copy of the 1.07 GB array.
-# - (Inherited) DYNAMIC XEB GUARD: Hilbert-scaled pt_var floor to trap ACE collapse.
-# - (Inherited) IPC DRAIN OPTIMIZATION: Proactive open_pipes removal on complete delivery.
-# - (Inherited) TOPOLOGY DOCS: factor_width(27) explicitly yields a 9x3 grid aspect ratio.
+# CHANGES (Rev 96):
+# - CORRECTNESS (CRITICAL): Moved the np.median(..., overwrite_input=True) call to 
+#   *after* fancy indexing (ideal_at = ideal_probs[idxs]). The in-place partition 
+#   scrambles the array's index-to-probability mapping, which was corrupting XEB, 
+#   HOG, and L2 scores for all patches.
+# - PERFORMANCE: Removed the redundant list() cast around experiment.measure_shots.
+#
+# CHANGES (Rev 95):
+# - CORRECTNESS: Reverted HOG threshold to the empirical np.median() of the specific 
+#   circuit to preserve ACE collapse detection (using overwrite_input=True to avoid copies).
+# - ROBUSTNESS: Used zip(*counts.items()) for strict key/value array pairing.
+# - PERFORMANCE: Removed final superfluous gc.collect() in worker loop.
+#
+# CHANGES (Rev 94):
+# - CORRECTNESS: Bit-order probe explicitly asserts out_probs argmax is 1 or 2.
+# - CLARITY: Renamed l2_dist to l2_sq_dist to reflect squared formula.
+# - DESIGN: Added Effective_Depth (depth * cycles) to metrics.
 
 import os
 import sys
-import gc
 import csv
 import json
 import time
@@ -35,13 +41,11 @@ TOTAL_PATCHES = GRID_X * GRID_Y * GRID_Z
 QUBITS_PER_PATCH = 27
 
 # Topography tuning for raw statevectors.
-# Note: TOTAL_WORKERS=1 means this runs synchronously on a single GPU.
 GPUS_AVAILABLE = 1
 WORKERS_PER_GPU = 1
 TOTAL_WORKERS = GPUS_AVAILABLE * WORKERS_PER_GPU
 
-# Porter-Thomas ideal HOG score (median-threshold variant used by calc_stats
-# converges to 0.5 + ln(2)/2 for heavy-output-above-median at PT):
+# Porter-Thomas ideal HOG score (median-threshold variant used by calc_stats):
 PT_IDEAL_HOG = (1.0 + math.log(2.0)) / 2.0
 
 # =====================================================================
@@ -83,6 +87,10 @@ PAULI_OPS = ('I', 'X', 'Y', 'Z')
 
 
 def act_string(otoc: list, string: str):
+    """
+    Applies the Pauli string to the OTOC sequence. 
+    Note: 'i' assumes len(string) == width (QUBITS_PER_PATCH).
+    """
     for i in range(len(string)):
         match string[i]:
             case 'X':
@@ -100,8 +108,7 @@ def build_rcs_otoc_circuit(
 ) -> Tuple[list, List[str]]:
     lcv_range = range(width)
     
-    # Sycamore-style sequence: period is 8. For depth > 8, this sequence repeats,
-    # meaning the spatial entanglement coupling directions are periodic.
+    # Sycamore-style sequence: period is 8.
     gateSequence = [0, 3, 2, 1, 2, 1, 0, 3]
     row_len, col_len = factor_width(width)
 
@@ -155,9 +162,6 @@ def build_rcs_otoc_circuit(
     pauli_strings: List[str] = []
     otoc: list = []
     
-    # Multi-cycle scrambling semantics: [U * V1 * U†] * [U * V2 * U†] * ...
-    # This interleaves random Pauli kicks sequentially rather than evaluating
-    # a standard single OTOC measurement.
     for _cycle in range(cycles):
         otoc.extend(rcs)
         string = "".join(rng.choice(PAULI_OPS) for _ in range(width))
@@ -169,45 +173,49 @@ def build_rcs_otoc_circuit(
 
 
 def calc_stats(
-    ideal_probs: np.ndarray, counts: Dict[int, int],
+    ideal_probs: np.ndarray, counts: Counter,
     depth: int, cycles: int, shots: int, ace_qb: int
 ) -> Dict[str, Any]:
     n_pow = int(ideal_probs.size)
     n = int(round(math.log2(n_pow)))
     u_u = float(np.mean(ideal_probs))
-    
-    # PERFORMANCE BOTTLENECK: np.median uses an O(N) np.partition, but must allocate 
-    # a full array copy to prevent mutating ideal_probs. At 27 qubits, this forces 
-    # a ~1.07 GB float64 memory-bandwidth tax on the CPU.
-    threshold = float(np.median(ideal_probs))
-    
     uniform = 1.0 / n_pow
-
+    
     total_mass = float(np.sum(ideal_probs))
     sum_sq_ideal = float(np.dot(ideal_probs, ideal_probs))
 
     denom = sum_sq_ideal - (u_u * total_mass)
 
-    idxs = np.array(list(counts.keys()), dtype=np.int64)
-    freqs = np.array([counts[int(k)] for k in idxs], dtype=np.float64) / shots
+    if counts:
+        idxs_tuple, raw_counts_tuple = zip(*counts.items())
+        idxs = np.array(idxs_tuple, dtype=np.int64)
+        freqs = np.array(raw_counts_tuple, dtype=np.float64) / shots
+    else:
+        idxs = np.array([], dtype=np.int64)
+        freqs = np.array([], dtype=np.float64)
+    
     ideal_at = ideal_probs[idxs]
     ic_at = ideal_at - u_u
 
+    # PER-CIRCUIT EMPIRICAL MEDIAN (Rev 96 Fix)
+    # MUST be calculated AFTER ideal_at is extracted. overwrite_input=True uses 
+    # np.partition, which scrambles the array's index-to-probability mapping.
+    threshold = float(np.median(ideal_probs, overwrite_input=True))
+
     numer = float(np.dot(ic_at, freqs))
     
-    # Dynamic scale against PT baseline to trap near-uniform ACE distributions
     pt_var = 1.0 / n_pow
     xeb = numer / denom if denom > (pt_var * 1e-3) else 0.0
 
     hog_prob = float(np.sum(freqs[ideal_at > threshold]))
 
-    l2_dist = (
+    l2_sq_dist = (
         sum_sq_ideal
         - float(np.dot(ideal_at, ideal_at))
         + float(np.sum((ideal_at - freqs) ** 2))
     )
     
-    l2_dist_random = (
+    l2_sq_dist_random = (
         sum_sq_ideal - 2.0 * uniform * total_mass + float(n_pow) * uniform * uniform
     )
 
@@ -216,10 +224,11 @@ def calc_stats(
         "ace_qb_limit": ace_qb,
         "depth": depth,
         "cycles": cycles,
+        "effective_depth": depth * cycles,
         "xeb": float(xeb),
         "hog_prob": float(hog_prob),
-        "l2_dist": float(l2_dist),
-        "l2_dist_vs_uniform_random": float(l2_dist_random),
+        "l2_sq_dist": float(l2_sq_dist),
+        "l2_sq_dist_vs_uniform_random": float(l2_sq_dist_random),
     }
 
 # =====================================================================
@@ -261,6 +270,10 @@ def gpu_worker_process(
                 f"Fatal: measure_shots value ({_sv[0]}) and out_probs argmax "
                 f"({_pk}) disagree on bit order; calc_stats indexing is unsafe."
             )
+        if _pk not in (1, 2):
+            raise RuntimeError(
+                f"Fatal: Unexpected bit ordering. Expected 1 (LSB) or 2 (MSB), got {_pk}."
+            )
         del _probe
 
         all_bits = list(range(QUBITS_PER_PATCH))
@@ -295,8 +308,9 @@ def gpu_worker_process(
             t_gates = time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            samples = list(experiment.measure_shots(all_bits, shots))
-            counts = dict(Counter(samples))
+            raw_samples = experiment.measure_shots(all_bits, shots)
+            counts = Counter(raw_samples)
+            samples_arr = np.array(raw_samples, dtype=np.uint32)
             t_sample = time.perf_counter() - t0
             del experiment
 
@@ -304,18 +318,18 @@ def gpu_worker_process(
             ideal = np.asarray(control.out_probs(), dtype=np.float64)
             t_probs = time.perf_counter() - t0
             del control
-            gc.collect()
 
             t0 = time.perf_counter()
             stats = calc_stats(ideal, counts, depth, cycles, shots, ace_qb)
             t_stats = time.perf_counter() - t0
+            
+            # ideal is mutated by the overwrite_input=True median calculation in calc_stats
             del ideal
-            gc.collect()
 
             payload = dict(stats)
             payload.update({
                 "pauli_strings": pauli_strings,
-                "samples": np.array(samples, dtype=np.uint32),
+                "samples": samples_arr,
                 "seed": seed_int,
                 "lat_build_ms": t_build * 1000.0,
                 "lat_gates_ms": t_gates * 1000.0,
@@ -326,7 +340,6 @@ def gpu_worker_process(
             conn.send({p: payload})
 
     finally:
-        gc.collect()
         conn.close()
 
 # =====================================================================
@@ -356,15 +369,18 @@ class MultiGpuRcsOtocEngine:
 
     def _init_files(self, depth: int, cycles: int, shots: int):
         try:
+            row_len, col_len = factor_width(QUBITS_PER_PATCH)
             with open(self.config_file, 'w') as f:
                 json.dump({
-                    "grid_x": GRID_X, "grid_y": GRID_Y, "grid_z": GRID_Z,
+                    "patch_grid_topology": f"{GRID_X}x{GRID_Y}x{GRID_Z}",
+                    "intra_patch_topology": f"{row_len}x{col_len}",
                     "num_patches": TOTAL_PATCHES,
                     "qubits_per_patch": QUBITS_PER_PATCH,
                     "master_seed": self.master_seed,
                     "benchmark": "RCS-NN-OTOC-ACE",
                     "depth": depth,
                     "cycles": cycles,
+                    "effective_depth": depth * cycles,
                     "shots": shots,
                     "ace_qb_limit": (QUBITS_PER_PATCH + 3) >> 2,
                     "pt_ideal_xeb": 1.0,
@@ -372,15 +388,15 @@ class MultiGpuRcsOtocEngine:
                 }, f)
             with open(self.per_patch_csv, mode='w', newline='') as f:
                 csv.DictWriter(f, fieldnames=[
-                    "Patch", "X", "Y", "Z", "Seed", "XEB", "HOG_Prob",
-                    "L2_Dist", "L2_Dist_vs_Uniform",
-                    "Lat_Gates_ms", "Lat_Sample_ms", "Lat_Probs_ms"
+                    "Patch", "X", "Y", "Z", "Seed", "Effective_Depth", "XEB", "HOG_Prob",
+                    "L2_Sq_Dist", "L2_Sq_Dist_vs_Uniform", "Lat_Build_ms",
+                    "Lat_Gates_ms", "Lat_Sample_ms", "Lat_Probs_ms", "Lat_Stats_ms"
                 ]).writeheader()
             with open(self.aggregate_csv, mode='w', newline='') as f:
                 csv.DictWriter(f, fieldnames=[
-                    "Depth", "Cycles", "Shots", "Patches",
+                    "Depth", "Cycles", "Effective_Depth", "Shots", "Patches",
                     "XEB_Mean", "XEB_Std", "XEB_Min", "XEB_Max",
-                    "HOG_Mean", "HOG_Std", "L2_Mean", "L2_vs_Uniform_Mean"
+                    "HOG_Mean", "HOG_Std", "L2_Sq_Mean", "L2_Sq_vs_Uniform_Mean"
                 ]).writeheader()
         except Exception as e:
             print(f"[CSV] Warning: Setup configuration write failed: {e}",
@@ -391,19 +407,22 @@ class MultiGpuRcsOtocEngine:
             with open(self.per_patch_csv, mode='a', newline='') as f:
                 cx_, cy_, cz_ = self.patch_coords[p]
                 csv.DictWriter(f, fieldnames=[
-                    "Patch", "X", "Y", "Z", "Seed", "XEB", "HOG_Prob",
-                    "L2_Dist", "L2_Dist_vs_Uniform",
-                    "Lat_Gates_ms", "Lat_Sample_ms", "Lat_Probs_ms"
+                    "Patch", "X", "Y", "Z", "Seed", "Effective_Depth", "XEB", "HOG_Prob",
+                    "L2_Sq_Dist", "L2_Sq_Dist_vs_Uniform", "Lat_Build_ms",
+                    "Lat_Gates_ms", "Lat_Sample_ms", "Lat_Probs_ms", "Lat_Stats_ms"
                 ]).writerow({
                     "Patch": p, "X": cx_, "Y": cy_, "Z": cz_,
                     "Seed": payload["seed"],
+                    "Effective_Depth": payload["effective_depth"],
                     "XEB": payload["xeb"],
                     "HOG_Prob": payload["hog_prob"],
-                    "L2_Dist": payload["l2_dist"],
-                    "L2_Dist_vs_Uniform": payload["l2_dist_vs_uniform_random"],
+                    "L2_Sq_Dist": payload["l2_sq_dist"],
+                    "L2_Sq_Dist_vs_Uniform": payload["l2_sq_dist_vs_uniform_random"],
+                    "Lat_Build_ms": payload["lat_build_ms"],
                     "Lat_Gates_ms": payload["lat_gates_ms"],
                     "Lat_Sample_ms": payload["lat_sample_ms"],
                     "Lat_Probs_ms": payload["lat_probs_ms"],
+                    "Lat_Stats_ms": payload["lat_stats_ms"],
                 })
         except Exception as e:
             print(f"[CSV] Warning: Per-patch log write failed: {e}",
@@ -413,25 +432,26 @@ class MultiGpuRcsOtocEngine:
         try:
             xeb = np.array([results[p]["xeb"] for p in sorted(results)])
             hog = np.array([results[p]["hog_prob"] for p in sorted(results)])
-            l2  = np.array([results[p]["l2_dist"] for p in sorted(results)])
-            l2u = np.array([results[p]["l2_dist_vs_uniform_random"]
+            l2  = np.array([results[p]["l2_sq_dist"] for p in sorted(results)])
+            l2u = np.array([results[p]["l2_sq_dist_vs_uniform_random"]
                             for p in sorted(results)])
             with open(self.aggregate_csv, mode='a', newline='') as f:
                 csv.DictWriter(f, fieldnames=[
-                    "Depth", "Cycles", "Shots", "Patches",
+                    "Depth", "Cycles", "Effective_Depth", "Shots", "Patches",
                     "XEB_Mean", "XEB_Std", "XEB_Min", "XEB_Max",
-                    "HOG_Mean", "HOG_Std", "L2_Mean", "L2_vs_Uniform_Mean"
+                    "HOG_Mean", "HOG_Std", "L2_Sq_Mean", "L2_Sq_vs_Uniform_Mean"
                 ]).writerow({
-                    "Depth": depth, "Cycles": cycles, "Shots": shots,
-                    "Patches": len(results),
+                    "Depth": depth, "Cycles": cycles, 
+                    "Effective_Depth": depth * cycles,
+                    "Shots": shots, "Patches": len(results),
                     "XEB_Mean": float(np.mean(xeb)),
                     "XEB_Std": float(np.std(xeb)),
                     "XEB_Min": float(np.min(xeb)),
                     "XEB_Max": float(np.max(xeb)),
                     "HOG_Mean": float(np.mean(hog)),
                     "HOG_Std": float(np.std(hog)),
-                    "L2_Mean": float(np.mean(l2)),
-                    "L2_vs_Uniform_Mean": float(np.mean(l2u)),
+                    "L2_Sq_Mean": float(np.mean(l2)),
+                    "L2_Sq_vs_Uniform_Mean": float(np.mean(l2u)),
                 })
         except Exception as e:
             print(f"[CSV] Warning: Aggregate log write failed: {e}",
@@ -469,7 +489,7 @@ class MultiGpuRcsOtocEngine:
         print(f"[Engine] RCS-NN-OTOC / ACE-vs-Exact | {TOTAL_PATCHES} patches, "
               f"{total_qubits} qubits, {GPUS_AVAILABLE} GPUs "
               f"({WORKERS_PER_GPU} workers/GPU), depth={depth}, "
-              f"cycles={cycles}, shots={shots}/patch", flush=True)
+              f"cycles={cycles} (Eff Depth: {depth * cycles}), shots={shots}/patch", flush=True)
         print(f"[Engine] ACE limit: {(QUBITS_PER_PATCH + 3) >> 2} qb | "
               f"Ideal targets: XEB -> 1.0000, HOG -> {PT_IDEAL_HOG:.4f}",
               flush=True)
@@ -527,8 +547,8 @@ class MultiGpuRcsOtocEngine:
                             f"XEB: {payload['xeb']:+.4f} | "
                             f"HOG: {payload['hog_prob']:.4f} "
                             f"(PT {PT_IDEAL_HOG:.4f}) | "
-                            f"L2: {payload['l2_dist']:.3e} "
-                            f"(vs U: {payload['l2_dist_vs_uniform_random']:.3e}) | "
+                            f"L2 Sq: {payload['l2_sq_dist']:.3e} "
+                            f"(vs U: {payload['l2_sq_dist_vs_uniform_random']:.3e}) | "
                             f"Gates/Sample/Probs: "
                             f"{payload['lat_gates_ms']:7.1f}/"
                             f"{payload['lat_sample_ms']:6.1f}/"
@@ -537,11 +557,11 @@ class MultiGpuRcsOtocEngine:
                             flush=True
                         )
 
+                    # Simplified pipe drain logic
                     rank = pipe_rank[id(conn)]
-                    delivered_for_rank = len([p for p in self.worker_assignments[rank] if p in results])
-                    if delivered_for_rank == len(self.worker_assignments[rank]):
-                        if conn in open_pipes:
-                            open_pipes.remove(conn)
+                    delivered_for_rank = sum(1 for p in self.worker_assignments[rank] if p in results)
+                    if delivered_for_rank == len(self.worker_assignments[rank]) and conn in open_pipes:
+                        open_pipes.remove(conn)
 
             if len(results) != TOTAL_PATCHES:
                 raise RuntimeError(
@@ -585,7 +605,7 @@ class MultiGpuRcsOtocEngine:
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
 
-    # CLI: python3 multi_gpu_rcs_nn_otoc_ace_rev92.py [depth] [cycles] [shots]
+    # CLI: python3 multi_gpu_rcs_nn_otoc_ace_rev96.py [depth] [cycles] [shots]
     depth  = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     cycles = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     shots  = int(sys.argv[3]) if len(sys.argv) > 3 else 1 << min(9, QUBITS_PER_PATCH + 2)
