@@ -1,4 +1,5 @@
-# Nearest-neighbor RCS: Automatic circuit elision
+# Nearest-neighbor RCS: Automatic circuit elision, with index-shifted-consensus
+# across QrackAceBackend instances.
 #
 # By Dan Strano and (Anthropic) Claude.
 
@@ -27,6 +28,56 @@ def factor_width(width):
         raise Exception("ERROR: Can't simulate prime number width!")
 
     return (row_len, col_len)
+
+
+# ---------------------------------------------------------------------------
+# Index-shift consensus helpers
+# ---------------------------------------------------------------------------
+# ACE's own internal patch assignment is a fixed function of raw qubit
+# INDEX alone (lq // row_length, lq % row_length -- verified directly
+# against QrackAceBackend's source earlier in this session), independent
+# of whatever topology a circuit imposes on those same indices. Shifting
+# the index-to-(row,col) mapping per instance moves each instance's fixed
+# patch boundaries to a different physical location relative to the SAME
+# logical circuit, so the localized approximation error that concentrates
+# near a boundary lands in a different place each time. This uses the
+# SAME flatten convention verified against ACE's real source a few turns
+# ago in nn_qab.py: b = col * row_len + row (not row * row_len + col,
+# which was the OTHER script's now-known bug).
+
+def shift_index(i, row_shift, col_shift, row_len, col_len):
+    """Re-express flat index i's (row, col) position under a cumulative
+    (row_shift, col_shift) offset, with modular wraparound on each
+    dimension independently, then re-flatten via ACE's own convention.
+    """
+    row = i % row_len
+    col = i // row_len
+    shifted_row = (row + row_shift) % row_len
+    shifted_col = (col + col_shift) % col_len
+    return shifted_col * row_len + shifted_row
+
+
+def build_shift_map(row_shift, col_shift, row_len, col_len, width):
+    """orig_to_shifted[orig_i] = the actual physical qubit index a given
+    instance should use to represent original circuit position orig_i.
+    A true bijection on [0, width) for any integer shift, verified
+    separately before this was written into the real script.
+    """
+    return [shift_index(i, row_shift, col_shift, row_len, col_len) for i in range(width)]
+
+
+def unshift_sample(sample, orig_to_shifted):
+    """Transform one measured outcome (bits indexed by an instance's
+    SHIFTED qubit layout) back to the ORIGINAL circuit's index labeling,
+    so bit position k means the same logical qubit across every instance
+    and against ideal_probs, which was computed from the unshifted
+    circuit.
+    """
+    result = 0
+    for orig_i, shifted_i in enumerate(orig_to_shifted):
+        bit = (sample >> shifted_i) & 1
+        result |= bit << orig_i
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -134,24 +185,41 @@ def bench_qrack(width, depth, sdrp=0.0):
     shots_per    = shots // n_inst
     shots        = shots_per * n_inst
 
+    row_len, col_len = factor_width(width)
+
+    # Per-instance cumulative index shift: instance k uses shift (k, k),
+    # per the requested "shifting by one row and one column, iteratively
+    # compounded for each subsequent instance." Precompute each instance's
+    # full index-remapping once, up front.
+    shift_maps = [
+        build_shift_map(inst, inst, row_len, col_len, width) for inst in range(n_inst)
+    ]
+
     # -----------------------------------------------------------------------
-    # Build circuit once in Qiskit
+    # Build the circuit ONCE, in terms of the ORIGINAL (unshifted) qubit
+    # indices -- this is the single logical circuit every instance is
+    # meant to represent, just at a different physical index layout.
+    # qc_logical holds gate tuples using ORIGINAL indices; each instance's
+    # actual gate list is derived from this by remapping indices through
+    # that instance's shift_map at dispatch time below, rather than
+    # rebuilding the circuit from scratch per instance -- this guarantees
+    # every instance really is representing the SAME logical circuit
+    # (same random angles, same random 2-qubit gate choices, same
+    # per-layer gate ORDER), differing only in index layout, not content.
     # -----------------------------------------------------------------------
     t_circ = time.perf_counter()
-    qc      = [[] for _ in range(n_inst)]
+    qc_logical = []
 
     # Nearest-neighbor couplers:
     gateSequence = [0, 3, 2, 1, 2, 1, 0, 3]
     two_bit_gates = swap, pswap, mswap, nswap, iswap, iiswap, cx, cy, cz, acx, acy, acz
-    row_len, col_len = factor_width(width)
 
     for _ in range(depth):
         for i in lcv_range:
             th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
             # Keep it Haar-random towards the poles:
             th = math.pi + 2 * th * abs(math.cos(th))
-            for c in qc:
-                c.append((u, i, th, ph, lm))
+            qc_logical.append((u, i, th, ph, lm))
 
         gate = gateSequence.pop(0)
         gateSequence.append(gate)
@@ -181,16 +249,15 @@ def bench_qrack(width, depth, sdrp=0.0):
                 g = random.choice(two_bit_gates)
                 cl.append((g, b1, b2))
 
-        for c in qc:
-            random.shuffle(cl)
-            for g in cl:
-                c.append(g)
+        random.shuffle(cl)
+        qc_logical.extend(cl)
 
     # -----------------------------------------------------------------------
-    # Ideal ground truth
+    # Ideal ground truth -- run directly against the ORIGINAL, unshifted
+    # indices, exactly as ideal_probs' bit positions are meant to mean.
     # -----------------------------------------------------------------------
     sim_ideal = QrackSimulator(width)
-    run_circuit(sim_ideal, qc[0])
+    run_circuit(sim_ideal, qc_logical)
     ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
     del sim_ideal
 
@@ -199,20 +266,43 @@ def bench_qrack(width, depth, sdrp=0.0):
     print(f"qrack_circuit_seconds: {t_ideal - t_circ}")
 
     # -----------------------------------------------------------------------
-    # Method: ACE prob_perm over full Hilbert space.
-    # Since the ideal simulation is already materialized for ground truth,
-    # we can afford to walk all 2^n permutations with prob_perm — giving
-    # the complete ACE probability distribution, not just sampled candidates.
-    # Two ACE instances (sequential + stride); average their prob_perm values.
+    # Method: ACE index-shifted consensus. Each instance runs the SAME
+    # logical circuit (qc_logical, unchanged), but every gate's qubit
+    # index is remapped through that instance's own shift_map before
+    # being applied -- so ACE's fixed, index-based patch boundaries fall
+    # at a different physical location relative to the circuit's actual
+    # coupling structure in each instance. Measured samples are then
+    # transformed BACK to the original index labeling via unshift_sample
+    # before being pooled, so every instance's counts refer to the same
+    # logical qubit at each bit position and remain directly comparable
+    # to ideal_probs.
     # -----------------------------------------------------------------------
     ace_counts = []
     for inst in range(n_inst):
+        shift_map = shift_maps[inst]
+
+        # Remap every gate's qubit indices through this instance's shift,
+        # preserving gate type, angle, and relative circuit order exactly.
+        instance_circuit = []
+        for gate_tuple in qc_logical:
+            fn = gate_tuple[0]
+            if fn is u:
+                _, i, th, ph, lm = gate_tuple
+                instance_circuit.append((u, shift_map[i], th, ph, lm))
+            else:
+                _, q1, q2 = gate_tuple
+                instance_circuit.append((fn, shift_map[q1], shift_map[q2]))
+
         sim = QrackAceBackend(width)
         if sdrp > 0.0:
             for s in sim.sim:
                 s.set_sdrp(sdrp)
-        run_circuit(sim, qc[inst])
-        ace_counts = ace_counts + sim.measure_shots(all_bits, shots_per)
+        run_circuit(sim, instance_circuit)
+
+        raw_samples = sim.measure_shots(all_bits, shots_per)
+        # Transform each measured sample back to the ORIGINAL circuit's
+        # index labeling before pooling into the shared consensus counts.
+        ace_counts.extend(unshift_sample(s, shift_map) for s in raw_samples)
 
     ace_counts = dict(Counter(ace_counts))
 
@@ -236,7 +326,7 @@ def bench_qrack(width, depth, sdrp=0.0):
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 fc_ace.py [width] [depth] [sdrp=0.1464466]")
+            "Usage: python3 nn_qab_consensus.py [width] [depth] [sdrp=0.1464466]")
     width = int(sys.argv[1])
     depth = int(sys.argv[2])
     sdrp  = float(sys.argv[3]) if len(sys.argv) > 3 else ((1 - 1 / math.sqrt(2)) / 2)
