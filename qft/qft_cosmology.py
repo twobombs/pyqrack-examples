@@ -16,16 +16,14 @@ def bench_qrack(n):
     # This is a discrete Fourier transform, after initializing all qubits randomly but separably.
     start = time.perf_counter()
 
-    qsim = QrackSimulator(1, is_schmidt_decompose=False, is_stabilizer_hybrid=False, is_gpu=False)
+    qsim = QrackSimulator(1)
 
     result_bits = []
     for c in range(n):
-        qsim.u(
-            0,
-            random.uniform(0, 2 * math.pi),
-            random.uniform(0, 2 * math.pi),
-            random.uniform(0, 2 * math.pi),
-        )
+        th, ph, lm = (random.uniform(-math.pi, math.pi) for _ in range(3))
+        # Keep it Haar-random towards the poles:
+        th = math.asin(th / math.pi)
+        qsim.u(0, th, ph, lm)
         qsim.h(0)
         phase_factor = cmath.exp(1j * math.pi)
         for t in range(c):
