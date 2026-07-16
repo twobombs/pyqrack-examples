@@ -2,7 +2,30 @@
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 #
-# REVISION 89.1 - SEPARABLE-QUBIT SEMICLASSICAL QFT SAMPLER MERGE + ROBUSTNESS
+# REVISION 89.4 - QFT SPECTRAL ANALYSIS DOCUMENTATION
+#
+# NEW (Rev 89.4):
+# - SPECTRAL ANALYSIS NOTE: Documented a crucial physical property of the 
+#   semiclassical QFT output. The first bit (c=0) of every patch's bitstring 
+#   receives no phase feedback and is deterministically sampled purely from 
+#   the prepared Bloch state (probing the XY-plane orientation). It is 
+#   qualitatively different from bits 1-26, which are dynamically steered by 
+#   the accumulated phase feedback. Downstream spectral analysis pipelines 
+#   must account for this structural asymmetry.
+#
+# NEW (Rev 89.3):
+# - PHYSICS FIX: Swapped the order of the batched phase correction and 
+#   the Hadamard gate in both the worker QFT sampler and the standalone 
+#   benchmark. Phase feedback now correctly applies *before* H, making 
+#   the measurement probabilities physically responsive to the accumulated 
+#   phase, genuinely implementing the Griffiths-Niu semiclassical QFT.
+#
+# NEW (Rev 89.2):
+# - PHASE BATCHING: Collapsed O(N^2) conditional mtrx() phase correction 
+#   calls in the semiclassical QFT inner loops into a single U-gate call.
+#   Instead of executing 0-26 ctypes round-trips per qubit, the script 
+#   accumulates the phase mathematically (via exact binary floating-point 
+#   halving) and issues at most one qsim.u() call, vastly reducing CPU overhead.
 #
 # NEW (Rev 89.1):
 # - EXPLICIT SPATIAL TRAVERSAL: The QFT sampler now enforces a strict 
@@ -113,7 +136,7 @@ def bench_qrack(n):
 
     start = time.perf_counter()
 
-    qsim = QrackSimulator(1, is_schmidt_decompose=False,
+    qsim = QrackSimulator(1, is_schmidt_decompose_multi=False,
                           is_stabilizer_hybrid=False, is_gpu=False)
 
     result_bits = []
@@ -124,13 +147,19 @@ def bench_qrack(n):
             random.uniform(0, 2 * math.pi),
             random.uniform(0, 2 * math.pi),
         )
-        qsim.h(0)
-        phase_factor = cmath.exp(1j * math.pi)
+        
+        # FIX: Phase feedback applies before H
+        total_phase = 0.0
+        current_phase = math.pi / 2.0
         for t in range(c):
-            phase_factor = cmath.sqrt(phase_factor)
-            # FIX: Iterate backward against measurement history for correct QFT phasing
             if result_bits[c - 1 - t]:
-                qsim.mtrx([1.0, 0.0, 0.0, phase_factor], 0)
+                total_phase += current_phase
+            current_phase /= 2.0
+            
+        if total_phase != 0.0:
+            qsim.u(0, 0.0, 0.0, total_phase)
+            
+        qsim.h(0)
         b = qsim.m(0)
         result_bits.append(b)
         if b:
@@ -318,13 +347,14 @@ def gpu_worker_process(
                 if abs(theta_z) > 1e-12: apply_rz(sim, theta_z, q)
 
         # =============================================================
-        # SEPARABLE-QUBIT SEMICLASSICAL QFT SAMPLER (Rev 89.1)
+        # SEPARABLE-QUBIT SEMICLASSICAL QFT SAMPLER (Rev 89.4)
         # Semiclassical QFT over the patch's single-qubit marginals.
         # Standard gates only (u/h/mtrx/prob) -> no Pauli-code or angle
-        # convention dependency. 1-qubit CPU sim; mtrx is safe here.
+        # convention dependency. 1-qubit CPU sim; phase corrections are
+        # batched to avoid O(n^2) ctypes overhead.
         # =============================================================
         if enable_qft:
-            qft_sim = QrackSimulator(qubit_count=1, is_schmidt_decompose=False,
+            qft_sim = QrackSimulator(qubit_count=1, is_schmidt_decompose_multi=False,
                                      is_stabilizer_hybrid=False, is_gpu=False)
 
         _QFT_EPS = 1e-12
@@ -357,13 +387,18 @@ def gpu_worker_process(
                 phi = math.atan2(uy, ux)
                 qft_sim.u(0, theta, phi, 0.0)
 
-                qft_sim.h(0)
-                phase_factor = cmath.exp(1j * math.pi)
+                # FIX: Phase feedback applies before H
+                total_phase = 0.0
+                current_phase = math.pi / 2.0
                 for tq in range(c):
-                    phase_factor = cmath.sqrt(phase_factor)
-                    # FIX: Iterate backward against measurement history for correct QFT phasing
                     if result_bits[c - 1 - tq]:
-                        qft_sim.mtrx([1.0, 0.0, 0.0, phase_factor], 0)
+                        total_phase += current_phase
+                    current_phase /= 2.0
+                    
+                if total_phase != 0.0:
+                    qft_sim.u(0, 0.0, 0.0, total_phase)
+
+                qft_sim.h(0)
 
                 # Deterministic, provenance-seeded measurement: sample from
                 # prob(0) with our RNG instead of qsim.m()'s internal RNG.
@@ -440,7 +475,7 @@ def gpu_worker_process(
                             print(f"[Worker {rank}] Warning: sim.get_unitary_fidelity() not found. Upgrade PyQrack for true fidelity tracking.", file=sys.stderr)
                             _warned_fidelity = True
 
-                    # --- SEMICLASSICAL QFT PROBE (Rev 89.1) ---
+                    # --- SEMICLASSICAL QFT PROBE (Rev 89.4) ---
                     qft_bits, qft_lat = "", 0.0
                     if enable_qft:
                         qft_rng = np.random.default_rng(
@@ -780,7 +815,6 @@ class MultiGpuHadronEngine:
                     if proc.is_alive():
                         try: proc.kill()
                         except Exception: pass
-
 
 if __name__ == "__main__":
     # Standalone benchmark mode (original Strano script behavior):
