@@ -3,25 +3,23 @@
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + Integrated ACE Cross-Validation (from Dan Strano's fc_ace.py NN-RCS harness)
 #
-# REVISION 89.13 - FINAL POLISH (Clone Flags & Exception Handling)
+# REVISION 89.15 - CLONE METADATA OVERRIDE
 #
-# BUGFIXES (Rev 89.13):
-# - CLONE FLAGS: The `QrackSimulator(clone_sid=a.sid)` constructor now explicitly 
-#   passes `is_gpu=True`, `is_binary_decision_tree=False`, and `is_stabilizer_hybrid=False` 
-#   to match the source replica's Python-side metadata, preventing silent misdispatch.
-# - EXCEPTION HANDLING: Broadened the validation block exception guard to catch 
-#   `RuntimeError` (for C-level allocation failures) and structured the `a_clone`
-#   initialization to prevent `UnboundLocalError` if the constructor fails.
+# BUGFIXES (Rev 89.15):
+# - CLONE METADATA OVERRIDE (CRITICAL): PyQrack explicitly rejects passing both 
+#   `qubit_count` and `clone_sid` simultaneously. The constructor is now called 
+#   with `clone_sid` alone, followed by a direct post-construction attribute patch 
+#   (`a_clone.num_qubits = QUBITS_PER_PATCH`) to satisfy the Python-side 
+#   `measure_shots` bounds checker without triggering the mutual-exclusion guard.
 #
-# BUGFIXES (Rev 89.12):
-# - CLONE API: Replaced the speculative `.clone()`/`init_clone` fallback chain
-#   with the officially documented `QrackSimulator(clone_sid=a.sid)` constructor.
-# - PROB_PERM SPEC: Removed the `TypeError` integer fallback. The docs explicitly
-#   state `prob_perm` takes a list of bools. Explicitly casted the bitmask to 
-#   `bool` types to strictly conform to the API contract.
+# BUGFIXES (Rev 89.14):
+# - VRAM HYGIENE: Changed default `ACE_PROBE_PATCHES` to `[13]` (center patch only)
+#   to prevent massive PCIe paging and CPU fallbacks on Radeon Pro VII hardware.
 #
-# BUGFIXES (Rev 89.11 & older):
-# - Reattached clone SID correctly to prevent out-of-bounds measurement crashes.
+# BUGFIXES (Rev 89.13 & older):
+# - Aligned clone constructor to official API (`clone_sid`) with proper backend flags.
+# - Broadened validation exception catch to include `RuntimeError`.
+# - Stripped `TypeError` bit-reversal probe; strictly cast bitmasks to `bool`.
 # - Gated boundary kick application behind `is_measure` with accurate `time_delta`.
 # - Split `lat_ace_evol_ms` and `lat_ace_val_ms` for accurate profiling.
 
@@ -53,7 +51,7 @@ ACE_N_INST = 2                                   # ACE replicas per probed patch
 ACE_SDRP = (1.0 - 1.0 / math.sqrt(2.0)) / 2.0    # fc_ace.py default (~0.1464466)
 ACE_SHOTS = 256                                  # samples pooled across replicas per validation
 ACE_VALIDATE_EVERY = 5                           # in units of *measure* steps
-ACE_PROBE_PATCHES = None                         # None -> all patches; e.g. [13] for center-only
+ACE_PROBE_PATCHES = [13]                         # Center patch only to prevent VRAM exhaustion
 ACE_MSB_FIRST = False                            # Toggle based on specific PyQrack build bit-ordering
 
 # =====================================================================
@@ -415,12 +413,16 @@ def gpu_worker_process(
                             for a in ace_sims[patch_id]:
                                 # NON-DESTRUCTIVE SAMPLING:
                                 # Officially documented `clone_sid` constructor preserves state.
+                                # The Python-side `num_qubits` is patched directly post-construction
+                                # to bypass out-of-bounds guards without triggering multi-allocation guards.
                                 a_clone = pyqrack.QrackSimulator(
                                     clone_sid=a.sid,
                                     is_binary_decision_tree=False,
                                     is_stabilizer_hybrid=False,
                                     is_gpu=True,
                                 )
+                                a_clone.num_qubits = QUBITS_PER_PATCH
+                                
                                 try:
                                     samples.extend(a_clone.measure_shots(all_q, shots_per))
                                 finally:
