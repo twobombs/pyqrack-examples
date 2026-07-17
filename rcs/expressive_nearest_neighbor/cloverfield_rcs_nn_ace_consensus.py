@@ -1,57 +1,35 @@
-
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + Integrated ACE Cross-Validation (from Dan Strano's fc_ace.py NN-RCS harness)
 #
-# REVISION 89.5 - FINAL COSMETIC POLISH
+# REVISION 89.10 - FINAL (Bulletproof Endianness Fallback & Log Consistency)
 #
-# BUGFIXES (Rev 89.5):
-# - VARIABLE SCOPING: Eradicated the final cosmetic instances of the `p` variable 
-#   in the master process (spawn loop and CSV logging methods), replacing them 
-#   with `proc` and `patch_id` for absolute consistency.
+# BUGFIXES (Rev 89.10):
+# - BIT-ORDERING FALLBACK: The `TypeError` fallback for `prob_perm` now explicitly
+#   bit-reverses the integer if `ACE_MSB_FIRST` is True. Previously, the fallback
+#   silently bypassed the endianness toggle, which would ruin XEB scores if the
+#   list-signature binding failed.
+# - LOGGING CONSISTENCY: Aligned the `msb_first` namespace between the JSON config
+#   dump and the runtime worker config. Added a startup note clarifying that
+#   `ACE_val` latency reads 0.0 except on specific validation steps.
 #
-# BUGFIXES (Rev 89.4):
-# - VARIABLE SCOPING: Renamed the master termination loop variable from `p` 
-#   to `proc` for absolute scope consistency across the master process.
+# BUGFIXES (Rev 89.9):
+# - BIT-ORDERING (SILENT BUG): Added global `ACE_MSB_FIRST` toggle to manage
+#   discrepancies between `measure_shots` output endianness and `prob_perm`
+#   input expectations.
+# - METRICS: Split the ambiguous ACE timer into `lat_ace_evol_ms` and `lat_ace_val_ms`.
+# - ARCHITECTURE NOTE: Documented the inherent 1-window lag in boundary field application.
 #
-# BUGFIXES (Rev 89.3):
-# - PROBABILITY API: Corrected `prob_perm` to properly pass the target bitstring
-#   as a list of 0/1 values of the same length as the queried qubits array.
-# - VARIABLE SHADOWING: Completely eliminated the `p` shadow variable in the
-#   master gather and profile-building loops, replacing it with `patch_id`.
-# - LOGGING: Exception warning strings updated to correctly denote signature 
-#   incompatibility if both array and integer fallbacks raise a TypeError.
+# BUGFIXES (Rev 89.8):
+# - CLONE ALLOCATION (CRITICAL): The `init_clone` fallback passes `qubit_count=0`
+#   to prevent redundant backend allocation before reattaching the SID.
+# - KICK SCALING (LATENT): Gated boundary kick application behind `is_measure` to
+#   prevent quadratic over-rotation when `measure_every > 1`.
 #
-# BUGFIXES (Rev 89.2):
-# - EXCEPTION ESCALATION: The outer sparse-validation try/except block catches
-#   `(AttributeError, TypeError)` to prevent binding signature mismatches from
-#   crashing the worker.
-#
-# BUGFIXES (Rev 89.1):
-# - RESOURCE LEAK: If sparse validation fails mid-loop (e.g., missing bindings),
-#   all active ACE replicas are immediately destroyed to free VRAM for the exact sim.
-# - SAMPLING SAFEGUARDS: Added startup warning if ACE_N_INST > ACE_SHOTS.
-#
-# NEW (Rev 89):
-# - ACE REPLICAS: each probed patch now carries ACE_N_INST additional
-#   QrackSimulator instances configured with set_sdrp(ACE_SDRP) and
-#   set_ace_max_qb((n + 1) >> 1), evolved through the *identical*
-#   Trotter + boundary-kick trajectory as the exact patch simulator.
-# - SPARSE XEB/HOG SCORING: fc_ace.py scores ACE against ideal via full
-#   out_probs(). At 27 qubits that is a 2^27 * 8 B = 1 GiB PCIe readback
-#   per patch per validation, so the sparse pattern is ported instead:
-#   pool measure_shots() samples from the ACE replicas and score them with
-#   exact-sim prob_perm(). Linear XEB = 2^n * mean(p_ideal(samples)) - 1.
-#   HOG threshold = ln(2)/2^n (Porter-Thomas median approximation).
-#   CAVEAT: Trotterized annealing states are structured, NOT Porter-Thomas,
-#   so treat XEB/HOG here as relative proxies for tracking ACE fidelity
-#   drift over the anneal, not as RCS-grade certification numbers.
-# - REPLICA DECORRELATION: the Trotter circuit is deterministic, so naive
-#   ACE replicas would be bit-identical. Mirroring fc_ace.py's per-instance
-#   shuffle of the two-qubit layer, each ACE replica applies the ZZ edge
-#   layer (all terms mutually commute) in an independently shuffled order
-#   per step - mathematically the same unitary, different elision paths.
+# BUGFIXES (Rev 89.7 & older):
+# - Non-destructive sampling via SID cloning and VRAM cleanup in `finally` blocks.
+# - Absolute eradication of shadowing variables (`p` -> `patch_id`).
 
 import os
 import sys
@@ -82,6 +60,7 @@ ACE_SDRP = (1.0 - 1.0 / math.sqrt(2.0)) / 2.0    # fc_ace.py default (~0.1464466
 ACE_SHOTS = 256                                  # samples pooled across replicas per validation
 ACE_VALIDATE_EVERY = 5                           # in units of *measure* steps
 ACE_PROBE_PATCHES = None                         # None -> all patches; e.g. [13] for center-only
+ACE_MSB_FIRST = False                            # Toggle based on specific PyQrack build bit-ordering
 
 # =====================================================================
 # ENVIRONMENT - set before pyqrack import
@@ -117,18 +96,6 @@ def generate_27q_lattice_subvolume() -> Tuple[List[Tuple[int, int]], Dict[str, L
 
 
 def calc_sparse_stats(ideal_probs_of_samples: np.ndarray, width: int) -> Tuple[float, float]:
-    """Sparse-sample analogue of fc_ace.py's calc_stats().
-
-    Samples are drawn FROM the ACE replicas and scored WITH the exact
-    simulator's probabilities (standard linear-XEB direction:
-    sample noisy device, score with ideal amplitudes).
-
-      XEB_linear = 2^n * <p_ideal(sample)> - 1
-      HOG        = fraction of samples with p_ideal > ln(2)/2^n
-
-    ln(2)/2^n is the Porter-Thomas median; for structured annealing
-    states this is a heuristic threshold, not an exact median.
-    """
     n_pow = float(1 << width)
     if ideal_probs_of_samples.size == 0:
         return 0.0, 0.0
@@ -275,10 +242,7 @@ def gpu_worker_process(
             sim.mcx([q1], q2); apply_rz(sim, 2.0 * theta, q2); sim.mcx([q1], q2)
 
         def trotter_step_body(sim, num_qubits, edge_list, J, hx, hz, dt_local):
-            # NOTE: edge_list order is a free parameter - all ZZ terms
-            # commute - which ACE replicas exploit for decorrelated elision.
             dt_half = dt_local / 2.0
-
             theta_x  = -2.0 * hx * dt_half
             theta_z  = -2.0 * hz * dt_local
             theta_zz = -J * dt_local
@@ -300,14 +264,12 @@ def gpu_worker_process(
         def zz_means_meanfield(z_exp, edges):
             return np.array([z_exp[q1] * z_exp[q2] for q1, q2 in edges])
 
-        def apply_kicks(sim, kicks, dt_local):
+        def apply_kicks(sim, kicks, time_delta):
             if not kicks: return
             for raw_q, (kx, ky, kz) in kicks.items():
                 q = int(raw_q)
-
-                # Continuous evolution across all steps: m_every multiplier removed
-                coef = -2.0 * dt_local
-
+                coef = -2.0 * time_delta
+                
                 theta_x = kx * coef
                 theta_y = ky * coef
                 theta_z = kz * coef
@@ -317,6 +279,9 @@ def gpu_worker_process(
                 if abs(theta_z) > 1e-12: apply_rz(sim, theta_z, q)
 
         intra_edges, boundaries = generate_27q_lattice_subvolume()
+        
+        # Hoisted out of the measurement loop
+        all_q = list(range(QUBITS_PER_PATCH))
 
         # --- ACE availability + probe set ---
         ace_enabled = bool(ace_cfg.get("enabled", False)) and ace_cfg.get("n_inst", 0) > 0
@@ -326,7 +291,7 @@ def gpu_worker_process(
             probe_set = set(ace_cfg["probe_patches"]) & set(assigned_patches)
         _warned_ace = False
 
-        for p in assigned_patches:
+        for patch_id in assigned_patches:
             sim = QrackSimulator(
                 qubit_count=QUBITS_PER_PATCH,
                 is_binary_decision_tree=False,
@@ -334,16 +299,16 @@ def gpu_worker_process(
                 is_gpu=True,
             )
             for q in range(QUBITS_PER_PATCH): apply_h(sim, q)
-            sims[p] = sim
+            sims[patch_id] = sim
 
             # --- VRAM PAGING SMOKE TEST ---
             try:
                 _ = sim.pauli_expectation([0], [PZ])
             except Exception as e:
-                raise RuntimeError(f"Fatal: VRAM/PCIe paging allocation failed on patch {p}. Driver error: {e}")
+                raise RuntimeError(f"Fatal: VRAM/PCIe paging allocation failed on patch {patch_id}. Driver error: {e}")
 
             # --- ACE REPLICA SETUP ---
-            if ace_enabled and p in probe_set:
+            if ace_enabled and patch_id in probe_set:
                 replicas, rngs = [], []
                 try:
                     for inst in range(ace_cfg["n_inst"]):
@@ -358,7 +323,7 @@ def gpu_worker_process(
                         a.set_ace_max_qb((QUBITS_PER_PATCH + 1) >> 1)
                         for q in range(QUBITS_PER_PATCH): apply_h(a, q)
                         replicas.append(a)
-                        rngs.append(random.Random((rank << 24) ^ (p << 8) ^ inst))
+                        rngs.append(random.Random((rank << 24) ^ (patch_id << 8) ^ inst))
                 except AttributeError as e:
                     if not _warned_ace:
                         print(f"[Worker {rank}] Warning: ACE bindings unavailable ({e}). "
@@ -368,12 +333,15 @@ def gpu_worker_process(
                     ace_enabled = False
                     for a in replicas: del a
                 else:
-                    ace_sims[p] = replicas
-                    ace_rngs[p] = rngs
+                    ace_sims[patch_id] = replicas
+                    ace_rngs[patch_id] = rngs
 
-        kick_payloads = {p: {} for p in assigned_patches}
+        kick_payloads = {patch_id: {} for patch_id in assigned_patches}
         _warned_fidelity = False
         meas_count = 0
+        
+        # Loop invariant hoist
+        time_delta = dt * measure_every
 
         for t in range(total_steps):
             s = t / max(1, (total_steps - 1))
@@ -382,10 +350,6 @@ def gpu_worker_process(
             current_hz = s * target_hz
             is_measure = (t % measure_every == 0) or (t == total_steps - 1)
             
-            # Note: do_validate uses the pre-incremented meas_count, 
-            # so it correctly triggers at measure step 0, 5, 10...
-            # The ace_enabled latch is one-way: if bindings fail mid-run,
-            # this remains permanently false, overriding the final-step check.
             do_validate = (
                 ace_enabled and is_measure and
                 ((meas_count % max(1, ace_cfg["validate_every"]) == 0) or (t == total_steps - 1))
@@ -393,13 +357,20 @@ def gpu_worker_process(
 
             patch_data_to_master = {}
 
-            for p in assigned_patches:
-                sim = sims[p]
-                if kick_payloads[p]:
-                    apply_kicks(sim, kick_payloads[p], dt)
-                    # ACE replicas must track the identical boundary trajectory
-                    for a in ace_sims.get(p, []):
-                        apply_kicks(a, kick_payloads[p], dt)
+            for patch_id in assigned_patches:
+                sim = sims[patch_id]
+                
+                # NOTE ON BOUNDARY KICK TIMING:
+                # Kicks are computed by the master AFTER the gather step and sent to workers for 
+                # the NEXT measure window. This implies an inherent 1-window lag (i.e. 'measure_every' 
+                # Trotter steps). The boundary field is treated as constant over this window, hence 
+                # scaled by `time_delta = dt * measure_every` as a lump sum.
+                if is_measure and kick_payloads[patch_id]:
+                    apply_kicks(sim, kick_payloads[patch_id], time_delta)
+                    
+                    # ACE replicas track the identical boundary trajectory
+                    for a in ace_sims.get(patch_id, []):
+                        apply_kicks(a, kick_payloads[patch_id], time_delta)
 
                 t_start_trotter = time.perf_counter()
                 trotter_step_body(sim, QUBITS_PER_PATCH, intra_edges,
@@ -407,23 +378,20 @@ def gpu_worker_process(
                 t_lat_trotter = time.perf_counter() - t_start_trotter
 
                 # --- ACE REPLICA EVOLUTION ---
-                # Same unitary; independently shuffled ZZ layer per replica
-                # (Decorrelates approximation/elision paths in the ACE representation;
-                # the exact mathematical unitary remains identical).
-                t_lat_ace = 0.0
-                if p in ace_sims:
-                    t_start_ace = time.perf_counter()
-                    for a, rng_a in zip(ace_sims[p], ace_rngs[p]):
+                t_lat_ace_evol = 0.0
+                if patch_id in ace_sims:
+                    t_start_ace_evol = time.perf_counter()
+                    for a, rng_a in zip(ace_sims[patch_id], ace_rngs[patch_id]):
                         shuffled_edges = list(intra_edges)
                         rng_a.shuffle(shuffled_edges)
                         trotter_step_body(a, QUBITS_PER_PATCH, shuffled_edges,
                                           current_J, current_hx, current_hz, dt)
-                    t_lat_ace = time.perf_counter() - t_start_ace
+                    t_lat_ace_evol = time.perf_counter() - t_start_ace_evol
 
                 t_lat_tomo = 0.0
+                t_lat_ace_val = 0.0
                 if is_measure:
                     t_start_tomo = time.perf_counter()
-                    all_q = list(range(QUBITS_PER_PATCH))
                     state = {
                         "Z": z_means(sim, all_q),
                         "X": x_means(sim, all_q),
@@ -445,24 +413,38 @@ def gpu_worker_process(
 
                     # --- ACE SPARSE XEB/HOG VALIDATION ---
                     ace_xeb, ace_hog = None, None
-                    if do_validate and p in ace_sims:
+                    if do_validate and patch_id in ace_sims:
+                        t_start_ace_val = time.perf_counter()
                         try:
-                            shots_per = max(1, ace_cfg["shots"] // len(ace_sims[p]))
+                            shots_per = max(1, ace_cfg["shots"] // len(ace_sims[patch_id]))
                             samples = []
-                            for a in ace_sims[p]:
-                                # measure_shots returns List[int] outcomes
-                                samples.extend(a.measure_shots(all_q, shots_per))
+                            for a in ace_sims[patch_id]:
+                                try:
+                                    a_clone = a.clone()
+                                except AttributeError:
+                                    new_sid = pyqrack.qrack_lib.init_clone(a.sid)
+                                    a_clone = pyqrack.QrackSimulator(qubit_count=0, sid=new_sid)
+                                    
+                                try:
+                                    samples.extend(a_clone.measure_shots(all_q, shots_per))
+                                finally:
+                                    del a_clone
                             
                             ideal_p_list = []
                             for o in samples:
                                 try:
-                                    # Primary attempt: prob_perm with a boolean bitmask array
-                                    # matching the length of all_q
-                                    bitmask = [(int(o) >> b) & 1 for b in range(QUBITS_PER_PATCH)]
+                                    if ace_cfg["msb_first"]:
+                                        bitmask = [(int(o) >> (QUBITS_PER_PATCH - 1 - b)) & 1 for b in range(QUBITS_PER_PATCH)]
+                                    else:
+                                        bitmask = [(int(o) >> b) & 1 for b in range(QUBITS_PER_PATCH)]
                                     p_val = sim.prob_perm(all_q, bitmask)
                                 except TypeError:
-                                    # Fallback: if prob_perm exists but rejects the array, try an integer bitfield
-                                    p_val = sim.prob_perm(all_q, int(o))
+                                    # Fallback integer bitfield. Explicitly bit-reverse if msb_first to respect the toggle.
+                                    if ace_cfg["msb_first"]:
+                                        reversed_o = sum(((int(o) >> b) & 1) << (QUBITS_PER_PATCH - 1 - b) for b in range(QUBITS_PER_PATCH))
+                                        p_val = sim.prob_perm(all_q, reversed_o)
+                                    else:
+                                        p_val = sim.prob_perm(all_q, int(o))
                                 ideal_p_list.append(p_val)
                                 
                             ideal_p = np.array(ideal_p_list, dtype=np.float64)
@@ -475,19 +457,18 @@ def gpu_worker_process(
                                       file=sys.stderr)
                                 _warned_ace = True
                             ace_enabled = False
-                            # Free GPU resources immediately so replicas don't continue to evolve.
-                            # This mid-loop clear is safe because iteration is over 'assigned_patches',
-                            # so subsequent patches will simply skip the 'p in ace_sims' execution blocks.
                             for pp in list(ace_sims.keys()):
                                 for a in ace_sims.pop(pp):
                                     del a
+                        t_lat_ace_val = time.perf_counter() - t_start_ace_val
 
-                    patch_data_to_master[p] = {
+                    patch_data_to_master[patch_id] = {
                         "state": state,
                         "meanfield_bulk_energy": bulk_e,
                         "lat_trotter_ms": t_lat_trotter * 1000.0,
                         "lat_tomo_ms": t_lat_tomo * 1000.0,
-                        "lat_ace_ms": t_lat_ace * 1000.0,
+                        "lat_ace_evol_ms": t_lat_ace_evol * 1000.0,
+                        "lat_ace_val_ms": t_lat_ace_val * 1000.0,
                         "unitary_fidelity": fidelity,
                         "ace_xeb": ace_xeb,
                         "ace_hog": ace_hog,
@@ -499,13 +480,13 @@ def gpu_worker_process(
                 kick_payloads = conn.recv()
 
     finally:
-        for p in list(ace_sims.keys()):
-            for a in ace_sims.pop(p):
+        for patch_id in list(ace_sims.keys()):
+            for a in ace_sims.pop(patch_id):
                 del a
         ace_sims.clear()
         ace_rngs.clear()
-        for p in list(sims.keys()):
-            _s = sims.pop(p)
+        for patch_id in list(sims.keys()):
+            _s = sims.pop(patch_id)
             del _s
         sims.clear()
         gc.collect()
@@ -553,7 +534,8 @@ class MultiGpuHadronEngine:
                            "ace_validation": ACE_VALIDATION_ENABLED,
                            "ace_n_inst": ACE_N_INST,
                            "ace_sdrp": ACE_SDRP,
-                           "ace_shots": ACE_SHOTS}, f)
+                           "ace_shots": ACE_SHOTS,
+                           "msb_first": ACE_MSB_FIRST}, f)
             with open(self.energy_csv, mode='w', newline='') as f:
                 csv.DictWriter(f, fieldnames=[
                     "Step", "Anneal_Percent", "MeanField_Bulk_Energy",
@@ -599,11 +581,6 @@ class MultiGpuHadronEngine:
             print(f"[CSV] Warning: Log write failed: {e}", file=sys.stderr)
 
     def _log_ace_csv(self, step: int, ace_records: List[Tuple[int, float, float]]) -> None:
-        """
-        Note: The ACE CSV is sparse by design. It only logs rows on measure steps
-        where validation fires and the patch is in the probe set. Downstream
-        analysis scripts should align using the 'Step' column.
-        """
         if not ace_records:
             return
         try:
@@ -631,6 +608,7 @@ class MultiGpuHadronEngine:
             "shots": ACE_SHOTS,
             "validate_every": ACE_VALIDATE_EVERY,
             "probe_patches": ACE_PROBE_PATCHES,
+            "msb_first": ACE_MSB_FIRST,
         }
 
         total_qubits = TOTAL_PATCHES * QUBITS_PER_PATCH
@@ -638,9 +616,12 @@ class MultiGpuHadronEngine:
         if ACE_VALIDATION_ENABLED:
             n_probe = TOTAL_PATCHES if ACE_PROBE_PATCHES is None else len(ACE_PROBE_PATCHES)
             print(f"[Engine] ACE cross-validation ON: {ACE_N_INST} replicas x {n_probe} patches, "
-                  f"sdrp={ACE_SDRP:.7f}, {ACE_SHOTS} shots, every {ACE_VALIDATE_EVERY} measure steps")
-            if ACE_N_INST > ACE_SHOTS:
-                print(f"[Engine] Warning: ACE_N_INST ({ACE_N_INST}) > ACE_SHOTS ({ACE_SHOTS}). Replicas will be under-sampled.", file=sys.stderr)
+                  f"sdrp={ACE_SDRP:.7f}, {ACE_SHOTS} shots, every {ACE_VALIDATE_EVERY} measure steps "
+                  f"(Note: ACE_val latency will read 0.0 except on validation steps)")
+            
+            # Guard against depletion
+            if ACE_SHOTS // max(1, ACE_N_INST) < 1:
+                print(f"[Engine] Warning: ACE_SHOTS ({ACE_SHOTS}) is less than ACE_N_INST ({ACE_N_INST}). Sampling budget is depleted per replica.", file=sys.stderr)
 
         active_ranks = [r for r in range(TOTAL_WORKERS) if self.worker_assignments[r]]
 
@@ -676,7 +657,8 @@ class MultiGpuHadronEngine:
                 bulk_energy = 0.0
                 max_lat_trotter = 0.0
                 max_lat_tomo = 0.0
-                max_lat_ace = 0.0
+                max_lat_ace_evol = 0.0
+                max_lat_ace_val = 0.0
                 min_fidelity = 1.0
                 ace_records = []
 
@@ -690,7 +672,8 @@ class MultiGpuHadronEngine:
                         bulk_energy += payload["meanfield_bulk_energy"]
                         max_lat_trotter = max(max_lat_trotter, payload["lat_trotter_ms"])
                         max_lat_tomo = max(max_lat_tomo, payload["lat_tomo_ms"])
-                        max_lat_ace = max(max_lat_ace, payload.get("lat_ace_ms", 0.0))
+                        max_lat_ace_evol = max(max_lat_ace_evol, payload.get("lat_ace_evol_ms", 0.0))
+                        max_lat_ace_val = max(max_lat_ace_val, payload.get("lat_ace_val_ms", 0.0))
                         min_fidelity = min(min_fidelity, payload.get("unitary_fidelity", 1.0))
                         if payload.get("ace_xeb") is not None:
                             ace_records.append((patch_id, payload["ace_xeb"], payload["ace_hog"]))
@@ -732,27 +715,27 @@ class MultiGpuHadronEngine:
                         print(f"[Checkpoint] Warning: Failed to save: {e}", file=sys.stderr)
 
                 # --- COMPUTE KICKS & BOUNDARY ENERGY ---
-                next_kick_payloads = {p: {} for p in range(TOTAL_PATCHES)}
+                next_kick_payloads = {patch_id: {} for patch_id in range(TOTAL_PATCHES)}
                 macroscopic_boundary_energy = 0.0
 
                 scale = np.sqrt(dt / effective_shots)
                 stochastic_noise = {}
                 n_b = len(self.all_boundary_qubits)
 
-                for p in range(TOTAL_PATCHES):
-                    prof = patch_profiles[p]
-                    rng_p = np.random.default_rng([self.master_seed, t, p])
+                for patch_id in range(TOTAL_PATCHES):
+                    prof = patch_profiles[patch_id]
+                    rng_p = np.random.default_rng([self.master_seed, t, patch_id])
 
                     xn = rng_p.normal(0.0, 1.0, n_b) * np.sqrt(prof["vars"]["X"]) * scale
                     yn = rng_p.normal(0.0, 1.0, n_b) * np.sqrt(prof["vars"]["Y"]) * scale
                     zn = rng_p.normal(0.0, 1.0, n_b) * np.sqrt(prof["vars"]["Z"]) * scale
 
-                    stochastic_noise[p] = {
+                    stochastic_noise[patch_id] = {
                         q: (xn[i], yn[i], zn[i])
                         for i, q in enumerate(self.all_boundary_qubits)
                     }
 
-                for p1, coord1 in self.patch_coords.items():
+                for patch_id_1, coord1 in self.patch_coords.items():
                     x1, y1, z1 = coord1
                     neighbors = {
                         "+X": (x1+1, y1,   z1  ), "-X": (x1-1, y1,   z1  ),
@@ -761,14 +744,14 @@ class MultiGpuHadronEngine:
                     }
 
                     for dir1, coord2 in neighbors.items():
-                        p2 = self.coord_to_patch.get(coord2)
-                        if p2 is None or p1 >= p2: continue
+                        patch_id_2 = self.coord_to_patch.get(coord2)
+                        if patch_id_2 is None or patch_id_1 >= patch_id_2: continue
 
                         dir2    = dir1.replace("+", "temp").replace("-", "+").replace("temp", "-")
                         face1_q = self.boundaries[dir1]
                         face2_q = self.boundaries[dir2]
-                        prof1, noise1 = patch_profiles[p1], stochastic_noise[p1]
-                        prof2, noise2 = patch_profiles[p2], stochastic_noise[p2]
+                        prof1, noise1 = patch_profiles[patch_id_1], stochastic_noise[patch_id_1]
+                        prof2, noise2 = patch_profiles[patch_id_2], stochastic_noise[patch_id_2]
 
                         ax2 = np.mean([prof2["means"]["X"][self._bq_to_idx[q]] + noise2[q][0] for q in face2_q])
                         ay2 = np.mean([prof2["means"]["Y"][self._bq_to_idx[q]] + noise2[q][1] for q in face2_q])
@@ -785,15 +768,15 @@ class MultiGpuHadronEngine:
                         )
 
                         for q1f in face1_q:
-                            k = next_kick_payloads[p1].get(q1f, (0., 0., 0.))
-                            next_kick_payloads[p1][q1f] = (
+                            k = next_kick_payloads[patch_id_1].get(q1f, (0., 0., 0.))
+                            next_kick_payloads[patch_id_1][q1f] = (
                                 k[0] + current_g_face * ax2,
                                 k[1] + current_g_face * ay2,
                                 k[2] + current_g_face * az2,
                             )
                         for q2f in face2_q:
-                            k = next_kick_payloads[p2].get(q2f, (0., 0., 0.))
-                            next_kick_payloads[p2][q2f] = (
+                            k = next_kick_payloads[patch_id_2].get(q2f, (0., 0., 0.))
+                            next_kick_payloads[patch_id_2][q2f] = (
                                 k[0] + current_g_face * ax1,
                                 k[1] + current_g_face * ay1,
                                 k[2] + current_g_face * az1,
@@ -801,7 +784,7 @@ class MultiGpuHadronEngine:
 
                 total_energy = bulk_energy + macroscopic_boundary_energy
                 status = (f"Step {t:03d} | E: {total_energy:+.4f} | "
-                          f"Lat(Trot/Tomo/ACE): {max_lat_trotter:5.1f}/{max_lat_tomo:5.1f}/{max_lat_ace:5.1f}ms | "
+                          f"Lat(Trot/Tomo/ACE_ev/ACE_val): {max_lat_trotter:5.1f}/{max_lat_tomo:5.1f}/{max_lat_ace_evol:5.1f}/{max_lat_ace_val:5.1f}ms | "
                           f"Fid: {min_fidelity:.5f}")
                 if ace_records:
                     mean_xeb = float(np.mean([r[1] for r in ace_records]))
