@@ -1,3 +1,6 @@
+#### note: this documentation has been generated; claims in it are unverified at best or unwarrented for at the least. emptor caveat
+
+
 # Macroscopic Quantum Simulated Annealing via Stochastic Mean-Field Boundary Coupling and In-Place Random Circuit Sampling
 
 **Abstract**
