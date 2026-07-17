@@ -96,31 +96,38 @@ def calc_stats(ideal_probs, counts, shots):
     u_u = statistics.mean(ideal_probs)
     numer = 0
     denom = 0
+    inumer = 0
+    idenom = 0
     hog_prob = 0
     for b in range(n_pow):
         ideal = ideal_probs[b]
         patch = (counts.get(b, 0) / shots)
+        ipatch = u_u * (1.0 - patch)
 
         ideal_centered = ideal - u_u
         denom += ideal_centered * ideal_centered
         numer += ideal_centered * (patch - u_u)
+        idenom += ideal_centered * ideal_centered
+        inumer += ideal_centered * (ipatch - u_u)
 
         if ideal > threshold:
             hog_prob += patch
 
     xeb = numer / denom
-    return xeb, hog_prob
+    ixeb = inumer / idenom
+
+    return xeb, ixeb, hog_prob
 
 
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
 
-def bench_qrack(width, depth):
+def bench_qrack(width, depth, sdrp):
     lcv_range = range(width)
     all_bits  = list(lcv_range)
     n_pow     = 1 << width
-    shots     = 1 << min(8, width + 2)
+    shots     = 1 << min(12, width + 2)
 
     # Nearest-neighbor couplers:
     gateSequence = [0, 3, 2, 1, 2, 1, 0, 3]
@@ -175,6 +182,9 @@ def bench_qrack(width, depth):
     # Method: QrackAceBackend
     # -----------------------------------------------------------------------
     sim = QrackAceBackend(width)
+    if sdrp > 0.0:
+        for s in sim.sim:
+            s.set_sdrp(sdrp)
     sim.run_qiskit_circuit(qc, shots=0)
     ace_counts = dict(Counter(sim.measure_shots(all_bits, shots)))
 
@@ -192,13 +202,15 @@ def bench_qrack(width, depth):
     t_ideal = time.perf_counter()
     print(f"ideal_seconds: {t_ideal - t_ace:.4f}")
 
-    xeb_ace, hog_ace = calc_stats(ideal_probs, ace_counts, shots)
+    xeb_ace, ixeb_ace, hog_ace = calc_stats(ideal_probs, ace_counts, shots)
 
     return {
-        "width":    width,
-        "depth":    depth,
-        "xeb_ace":  xeb_ace,
-        "hog_ace":  hog_ace,
+        "width":           width,
+        "depth":           depth,
+        "sdrp":            sdrp,
+        "xeb_ace":         xeb_ace,
+        "hog_ace":         hog_ace,
+        "inverse_xeb_ace": ixeb_ace,
     }
 
 
@@ -208,10 +220,11 @@ def bench_qrack(width, depth):
 
 def main():
     if len(sys.argv) < 3:
-        raise RuntimeError("Usage: python3 fc_qab.py [width] [depth]")
+        raise RuntimeError("Usage: python3 fc_qab.py [width] [depth] [sdrp=0.1464466]")
     width  = int(sys.argv[1])
     depth  = int(sys.argv[2])
-    result = bench_qrack(width, depth)
+    sdrp  = float(sys.argv[3]) if len(sys.argv) > 3 else ((1 - 1 / math.sqrt(2)) / 2)
+    result = bench_qrack(width, depth, sdrp)
     for k, v in result.items():
         print(f"  {k}: {v}")
     return 0

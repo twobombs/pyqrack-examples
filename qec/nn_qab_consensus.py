@@ -152,23 +152,30 @@ def run_circuit(sim, circ):
 def calc_stats(ideal_probs, counts, shots):
     n_pow = len(ideal_probs)
     threshold = statistics.median(ideal_probs)
-    u_u = statistics.mean(ideal_probs)
+    u_u = 1 / n_pow
     numer = 0
     denom = 0
+    inumer = 0
+    idenom = 0
     hog_prob = 0
     for b in range(n_pow):
         ideal = ideal_probs[b]
         patch = (counts.get(b, 0) / shots)
+        ipatch = u_u * (1.0 - patch)
 
         ideal_centered = ideal - u_u
         denom += ideal_centered * ideal_centered
         numer += ideal_centered * (patch - u_u)
+        idenom += ideal_centered * ideal_centered
+        inumer += ideal_centered * (ipatch - u_u)
 
         if ideal > threshold:
             hog_prob += patch
 
     xeb = numer / denom
-    return xeb, hog_prob
+    ixeb = inumer / idenom
+
+    return xeb, ixeb, hog_prob
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +188,7 @@ def bench_qrack(width, depth, sdrp=0.0):
     n_inst       = 4
     n_pow        = 1 << width
     u_u          = 1.0 / n_pow
-    shots        = 1 << min(8, width + 2)
+    shots        = 1 << min(12, width + 2)
     shots_per    = shots // n_inst
     shots        = shots_per * n_inst
 
@@ -306,16 +313,17 @@ def bench_qrack(width, depth, sdrp=0.0):
 
     ace_counts = dict(Counter(ace_counts))
 
-    xeb_ace, hog_ace = calc_stats(ideal_probs, ace_counts, shots)
+    xeb_ace, ixeb_ace, hog_ace = calc_stats(ideal_probs, ace_counts, shots)
 
     t_elapsed = time.perf_counter() - t_ideal
 
     return {
-        "width":         width,
-        "depth":         depth,
-        "sdrp":          sdrp,
-        "xeb_ace":       xeb_ace,
-        "hog_ace":       hog_ace,
+        "width":           width,
+        "depth":           depth,
+        "sdrp":            sdrp,
+        "xeb_ace":         xeb_ace,
+        "hog_ace":         hog_ace,
+        "inverse_xeb_ace": ixeb_ace,
     }
 
 
