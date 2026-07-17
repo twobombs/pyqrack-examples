@@ -7,7 +7,7 @@
 # One card will bare the brunt of the simulation at 40GB the other a little less
 # Measuring will take a long time and will OOM on the GPUs if you have <40GB vram
 # 
-# onservarion: AMD Mesa driver does swap out to GTT - NVIDIA will not and OOM 
+# observarion: AMD Mesa driver does swap out to GTT - NVIDIA will not and OOM 
 # 
 # REVISION 89.23 - ASYMMETRIC TOPOLOGY HOTFIX
 #
