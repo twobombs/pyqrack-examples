@@ -3,21 +3,25 @@
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + Integrated ACE Cross-Validation (from Dan Strano's fc_ace.py NN-RCS harness)
 #
-# REVISION 89.21 - NUMA STAGGER EXPANSION & HEARTBEATS
+# REVISION 89.23 - ASYMMETRIC TOPOLOGY HOTFIX
+#
+# BUGFIXES (Rev 89.23):
+# - TELEMETRY: Removed residual `WORKERS_PER_GPU` variable from the startup print
+#   statement. The asymmetric topography means workers are no longer symmetric 
+#   per GPU.
+#
+# BUGFIXES (Rev 89.22):
+# - ASYMMETRIC ROUTING (CRITICAL): Resolved OpenCL error -4 (Allocation Failure).
+#   The NVIDIA CMP 50HX (8GB) hard-crashes when VRAM is oversubscribed, whereas
+#   the AMD Pro VII (16GB) pages to GTT smoothly. The engine now assigns 22 patches 
+#   to GPU 0 (Workers 0,1,2) and exactly 5 patches to GPU 1 (Worker 3).
+# - ISOLATED ACE REPLICAS: `ACE_PROBE_PATCHES` is pinned to `[26]`, routing the 
+#   validation overhead entirely to Worker 3. Total GPU 1 footprint is capped at 
+#   ~7.4GB, preventing the CUDA memory manager from thrashing and failing.
 #
 # BUGFIXES (Rev 89.21):
 # - NUMA STAGGER: Expanded the worker startup stagger from 4.0s to 15.0s per rank. 
-#   Allocating ~15GB of statevectors under GTT pressure takes substantial time, 
-#   and 4 seconds was too narrow to prevent overlap and memory bus deadlock.
-# - OBSERVABILITY: Added worker heartbeat prints as they awaken from the stagger, 
-#   along with a master notice, so the intended 45-60s IPC gathering silence at 
-#   step 0 is not mistaken for a system hang.
-#
-# BUGFIXES (Rev 89.20 & 89.19):
-# - DUAL-GPU LOAD BALANCING: Scaled topography to GPUS_AVAILABLE = 2 and 
-#   WORKERS_PER_GPU = 2.
-# - REPLICA ROUTING: Targeted `ACE_PROBE_PATCHES = [14]` to isolate replicas on GPU 1.
-# - RAM HYGIENE: Added explicit `del exact_ket` to force immediate garbage collection.
+# - OBSERVABILITY: Added worker heartbeat prints as they awaken from the stagger.
 #
 # BUGFIXES (Rev 89.18 & older):
 # - Added `a.reset_unitary_fidelity()` to guarantee clean sliding-window epoch tracking.
@@ -40,10 +44,9 @@ GRID_X, GRID_Y, GRID_Z = 3, 3, 3
 TOTAL_PATCHES = GRID_X * GRID_Y * GRID_Z
 QUBITS_PER_PATCH = 27
 
-# Topography tuning for raw statevectors
+# Asymmetric Topography tuning
 GPUS_AVAILABLE = 2
-WORKERS_PER_GPU = 2  # 4 workers total (0,1 on GPU 0; 2,3 on GPU 1)
-TOTAL_WORKERS = GPUS_AVAILABLE * WORKERS_PER_GPU
+TOTAL_WORKERS = 4  # Workers 0,1,2 on GPU 0; Worker 3 on GPU 1
 
 # --- ACE CROSS-VALIDATION CONFIGURATION (ported from fc_ace.py) ---
 ACE_VALIDATION_ENABLED = True
@@ -51,7 +54,7 @@ ACE_N_INST = 2                                   # ACE replicas per probed patch
 ACE_SDRP = (1.0 - 1.0 / math.sqrt(2.0)) / 2.0    # fc_ace.py default (~0.1464466)
 ACE_SHOTS = 256                                  # samples pooled across replicas per validation
 ACE_VALIDATE_EVERY = 5                           # in units of *measure* steps
-ACE_PROBE_PATCHES = [14]                         # Routes to Worker 2 (GPU 1)
+ACE_PROBE_PATCHES = [26]                         # Routes exclusively to Worker 3 (NVIDIA CMP 50HX)
 ACE_MSB_FIRST = False                            # Toggle based on specific PyQrack build bit-ordering
 
 # =====================================================================
@@ -100,7 +103,6 @@ def calc_sparse_stats(ideal_probs_of_samples: np.ndarray, width: int) -> Tuple[f
 # =====================================================================
 def gpu_worker_process(
     rank: int,
-    workers_per_gpu: int,
     assigned_patches: List[int],
     conn: mp.connection.Connection,
     dt: float,
@@ -123,16 +125,16 @@ def gpu_worker_process(
     os.environ["PYQRACK_SHARED_LIB_PATH"] = "/usr/local/lib/qrack/libqrack_pinvoke.so"
     os.environ["OCL_ICD_PLATFORM_SORT"] = "none"
 
-    # Map multiple ranks to the same physical GPU device index
-    physical_gpu_index = rank // workers_per_gpu
+    # Asymmetric mapping: Rank 3 -> GPU 1 (NVIDIA); Ranks 0,1,2 -> GPU 0 (AMD)
+    physical_gpu_index = 1 if rank == 3 else 0
     os.environ["QRACK_OCL_DEFAULT_DEVICE"] = str(physical_gpu_index)
 
     # Bind QPager to the assigned device to enable driver-level PCIe paging
     os.environ["QRACK_QPAGER_DEVICES"] = str(physical_gpu_index)
     os.environ["QRACK_QUNITMULTI_DEVICES"] = str(physical_gpu_index)
 
-    # Unleash VRAM allocations, proportionally capping by worker density
-    alloc_mb = 64000 // workers_per_gpu
+    # Strict VRAM caps based on asymmetric topography
+    alloc_mb = 8000 if rank == 3 else 21000
     os.environ["QRACK_MAX_ALLOC_MB"] = str(alloc_mb)
     os.environ["QRACK_DISABLE_QUNIT_FIDELITY_GUARD"] = "1"
 
@@ -526,9 +528,15 @@ class MultiGpuHadronEngine:
 
         self._init_files()
 
+        # Asymmetric Load Balancing
+        # GPU 0 (AMD Pro VII, 16GB) pages natively to system GTT. Handles Patches 0-21.
+        # GPU 1 (NVIDIA CMP 50HX, 8GB) crashes on overcommit. Handles Patches 22-26 + ACE replicas.
         self.worker_assignments: List[List[int]] = [[] for _ in range(TOTAL_WORKERS)]
         for i in range(TOTAL_PATCHES):
-            self.worker_assignments[i % TOTAL_WORKERS].append(i)
+            if i < 22:
+                self.worker_assignments[i % 3].append(i) # Ranks 0,1,2 (GPU 0)
+            else:
+                self.worker_assignments[3].append(i)     # Rank 3 (GPU 1)
 
     def _init_files(self) -> None:
         try:
@@ -617,7 +625,7 @@ class MultiGpuHadronEngine:
         }
 
         total_qubits = TOTAL_PATCHES * QUBITS_PER_PATCH
-        print(f"[Engine] {TOTAL_PATCHES} patches, {total_qubits} qubits, {GPUS_AVAILABLE} GPUs ({WORKERS_PER_GPU} workers/GPU), {total_steps} steps")
+        print(f"[Engine] {TOTAL_PATCHES} patches, {total_qubits} qubits, {GPUS_AVAILABLE} GPUs ({TOTAL_WORKERS} workers total), {total_steps} steps")
         
         # Add a master notice about the expected boot delay so the user doesn't assume a hang.
         print(f"[Master] Waiting for staggered worker initialization (expect ~{TOTAL_WORKERS * 15}s delay)...", flush=True)
@@ -641,7 +649,7 @@ class MultiGpuHadronEngine:
             parent_conn, child_conn = mp.Pipe()
             proc = mp.Process(
                 target=gpu_worker_process,
-                args=(rank, WORKERS_PER_GPU, self.worker_assignments[rank], child_conn,
+                args=(rank, self.worker_assignments[rank], child_conn,
                       dt, total_steps, initial_hx, target_J, target_hx, target_hz,
                       measure_every, ace_cfg)
             )
