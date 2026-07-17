@@ -3,25 +3,25 @@
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + Integrated ACE Cross-Validation (from Dan Strano's fc_ace.py NN-RCS harness)
 #
-# REVISION 89.15 - CLONE METADATA OVERRIDE
+# REVISION 89.21 - NUMA STAGGER EXPANSION & HEARTBEATS
 #
-# BUGFIXES (Rev 89.15):
-# - CLONE METADATA OVERRIDE (CRITICAL): PyQrack explicitly rejects passing both 
-#   `qubit_count` and `clone_sid` simultaneously. The constructor is now called 
-#   with `clone_sid` alone, followed by a direct post-construction attribute patch 
-#   (`a_clone.num_qubits = QUBITS_PER_PATCH`) to satisfy the Python-side 
-#   `measure_shots` bounds checker without triggering the mutual-exclusion guard.
+# BUGFIXES (Rev 89.21):
+# - NUMA STAGGER: Expanded the worker startup stagger from 4.0s to 15.0s per rank. 
+#   Allocating ~15GB of statevectors under GTT pressure takes substantial time, 
+#   and 4 seconds was too narrow to prevent overlap and memory bus deadlock.
+# - OBSERVABILITY: Added worker heartbeat prints as they awaken from the stagger, 
+#   along with a master notice, so the intended 45-60s IPC gathering silence at 
+#   step 0 is not mistaken for a system hang.
 #
-# BUGFIXES (Rev 89.14):
-# - VRAM HYGIENE: Changed default `ACE_PROBE_PATCHES` to `[13]` (center patch only)
-#   to prevent massive PCIe paging and CPU fallbacks on Radeon Pro VII hardware.
+# BUGFIXES (Rev 89.20 & 89.19):
+# - DUAL-GPU LOAD BALANCING: Scaled topography to GPUS_AVAILABLE = 2 and 
+#   WORKERS_PER_GPU = 2.
+# - REPLICA ROUTING: Targeted `ACE_PROBE_PATCHES = [14]` to isolate replicas on GPU 1.
+# - RAM HYGIENE: Added explicit `del exact_ket` to force immediate garbage collection.
 #
-# BUGFIXES (Rev 89.13 & older):
-# - Aligned clone constructor to official API (`clone_sid`) with proper backend flags.
-# - Broadened validation exception catch to include `RuntimeError`.
-# - Stripped `TypeError` bit-reversal probe; strictly cast bitmasks to `bool`.
-# - Gated boundary kick application behind `is_measure` with accurate `time_delta`.
-# - Split `lat_ace_evol_ms` and `lat_ace_val_ms` for accurate profiling.
+# BUGFIXES (Rev 89.18 & older):
+# - Added `a.reset_unitary_fidelity()` to guarantee clean sliding-window epoch tracking.
+# - Abandoned non-destructive clones in favor of destructive measurement + `in_ket` resync.
 
 import os
 import sys
@@ -41,8 +41,8 @@ TOTAL_PATCHES = GRID_X * GRID_Y * GRID_Z
 QUBITS_PER_PATCH = 27
 
 # Topography tuning for raw statevectors
-GPUS_AVAILABLE = 1
-WORKERS_PER_GPU = 3  # Adjust >1 for decisive experiment comparison
+GPUS_AVAILABLE = 2
+WORKERS_PER_GPU = 2  # 4 workers total (0,1 on GPU 0; 2,3 on GPU 1)
 TOTAL_WORKERS = GPUS_AVAILABLE * WORKERS_PER_GPU
 
 # --- ACE CROSS-VALIDATION CONFIGURATION (ported from fc_ace.py) ---
@@ -51,7 +51,7 @@ ACE_N_INST = 2                                   # ACE replicas per probed patch
 ACE_SDRP = (1.0 - 1.0 / math.sqrt(2.0)) / 2.0    # fc_ace.py default (~0.1464466)
 ACE_SHOTS = 256                                  # samples pooled across replicas per validation
 ACE_VALIDATE_EVERY = 5                           # in units of *measure* steps
-ACE_PROBE_PATCHES = [13]                         # Center patch only to prevent VRAM exhaustion
+ACE_PROBE_PATCHES = [14]                         # Routes to Worker 2 (GPU 1)
 ACE_MSB_FIRST = False                            # Toggle based on specific PyQrack build bit-ordering
 
 # =====================================================================
@@ -112,6 +112,14 @@ def gpu_worker_process(
     measure_every: int,
     ace_cfg: Dict[str, Any]
 ) -> None:
+    # Stagger worker startup to prevent NUMA memory bus contention 
+    # during massive simultaneous 27-qubit statevector allocations.
+    import time as _t
+    stagger_time = rank * 15.0
+    if stagger_time > 0:
+        _t.sleep(stagger_time)
+    print(f"[Worker {rank}] Awakening after {stagger_time}s stagger... allocating statevectors.", flush=True)
+
     os.environ["PYQRACK_SHARED_LIB_PATH"] = "/usr/local/lib/qrack/libqrack_pinvoke.so"
     os.environ["OCL_ICD_PLATFORM_SORT"] = "none"
 
@@ -409,37 +417,42 @@ def gpu_worker_process(
                         t_start_ace_val = time.perf_counter()
                         try:
                             shots_per = max(1, ace_cfg["shots"] // len(ace_sims[patch_id]))
-                            samples = []
-                            for a in ace_sims[patch_id]:
-                                # NON-DESTRUCTIVE SAMPLING:
-                                # Officially documented `clone_sid` constructor preserves state.
-                                # The Python-side `num_qubits` is patched directly post-construction
-                                # to bypass out-of-bounds guards without triggering multi-allocation guards.
-                                a_clone = pyqrack.QrackSimulator(
-                                    clone_sid=a.sid,
-                                    is_binary_decision_tree=False,
-                                    is_stabilizer_hybrid=False,
-                                    is_gpu=True,
-                                )
-                                a_clone.num_qubits = QUBITS_PER_PATCH
-                                
-                                try:
-                                    samples.extend(a_clone.measure_shots(all_q, shots_per))
-                                finally:
-                                    del a_clone
                             
-                            ideal_p_list = []
-                            for o in samples:
-                                if ace_cfg["msb_first"]:
-                                    bitmask = [bool((int(o) >> (QUBITS_PER_PATCH - 1 - b)) & 1) for b in range(QUBITS_PER_PATCH)]
-                                else:
-                                    bitmask = [bool((int(o) >> b) & 1) for b in range(QUBITS_PER_PATCH)]
+                            # Extract the exact statevector ONCE per validation step (~2GB)
+                            exact_ket = sim.out_ket()
+                            
+                            for a in ace_sims[patch_id]:
+                                # DESTRUCTIVE SAMPLING:
+                                samples = a.measure_shots(all_q, shots_per)
                                 
-                                p_val = sim.prob_perm(all_q, bitmask)
-                                ideal_p_list.append(p_val)
+                                # RESYNC:
+                                a.in_ket(exact_ket)
                                 
-                            ideal_p = np.array(ideal_p_list, dtype=np.float64)
-                            ace_xeb, ace_hog = calc_sparse_stats(ideal_p, QUBITS_PER_PATCH)
+                                if ace_cfg["sdrp"] > 0.0:
+                                    a.set_sdrp(ace_cfg["sdrp"])
+                                a.set_ace_max_qb((QUBITS_PER_PATCH + 1) >> 1)
+                                
+                                # Reset the C++ fidelity accumulator for the new epoch
+                                try:
+                                    a.reset_unitary_fidelity()
+                                except AttributeError:
+                                    pass
+                            
+                                ideal_p_list = []
+                                for o in samples:
+                                    if ace_cfg["msb_first"]:
+                                        bitmask = [bool((int(o) >> (QUBITS_PER_PATCH - 1 - b)) & 1) for b in range(QUBITS_PER_PATCH)]
+                                    else:
+                                        bitmask = [bool((int(o) >> b) & 1) for b in range(QUBITS_PER_PATCH)]
+                                    
+                                    p_val = sim.prob_perm(all_q, bitmask)
+                                    ideal_p_list.append(p_val)
+                                    
+                                ideal_p = np.array(ideal_p_list, dtype=np.float64)
+                                ace_xeb, ace_hog = calc_sparse_stats(ideal_p, QUBITS_PER_PATCH)
+                                
+                            # Force host RAM reclamation
+                            del exact_ket
                             
                         except (AttributeError, TypeError, RuntimeError) as e:
                             if not _warned_ace:
@@ -605,6 +618,10 @@ class MultiGpuHadronEngine:
 
         total_qubits = TOTAL_PATCHES * QUBITS_PER_PATCH
         print(f"[Engine] {TOTAL_PATCHES} patches, {total_qubits} qubits, {GPUS_AVAILABLE} GPUs ({WORKERS_PER_GPU} workers/GPU), {total_steps} steps")
+        
+        # Add a master notice about the expected boot delay so the user doesn't assume a hang.
+        print(f"[Master] Waiting for staggered worker initialization (expect ~{TOTAL_WORKERS * 15}s delay)...", flush=True)
+        
         if ACE_VALIDATION_ENABLED:
             n_probe = TOTAL_PATCHES if ACE_PROBE_PATCHES is None else len(ACE_PROBE_PATCHES)
             print(f"[Engine] ACE cross-validation ON: {ACE_N_INST} replicas x {n_probe} patches, "
