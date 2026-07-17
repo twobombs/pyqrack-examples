@@ -1,4 +1,4 @@
-# -*- coding: us-ascii -*-
+# -*- coding: utf-8 -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.7)
@@ -44,6 +44,7 @@ import math
 import random
 import numpy as np
 import multiprocessing as mp
+import multiprocessing.connection
 from typing import List, Tuple, Dict, Any, Optional
 
 # --- GLOBAL CONFIGURATION ---
