@@ -2,7 +2,13 @@
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + Integrated ACE Cross-Validation (from Dan Strano's fc_ace.py NN-RCS harness)
-#
+# 
+# This revision is custom made for a total of 60GB vRAM divided over two cards
+# One card will bare the brunt of the simulation at 40GB the other a little less
+# Measuring will take a long time and will OOM on the GPUs if you have <40GB vram
+# 
+# onservarion: AMD Mesa driver does swap out to GTT - NVIDIA will not and OOM 
+# 
 # REVISION 89.23 - ASYMMETRIC TOPOLOGY HOTFIX
 #
 # BUGFIXES (Rev 89.23):
