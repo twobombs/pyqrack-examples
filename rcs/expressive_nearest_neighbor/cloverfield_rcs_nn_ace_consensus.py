@@ -2,36 +2,25 @@
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + Integrated ACE Cross-Validation (from Dan Strano's fc_ace.py NN-RCS harness)
-# 
-# This revision is custom made for a total of 60GB vRAM divided over two cards
-# One card will bare the brunt of the simulation at 40GB the other a little less
-# Measuring will take a long time and will OOM on the GPUs if you have <40GB vram
-# 
-# observarion: AMD Mesa driver does swap out to GTT - NVIDIA will not and OOM 
-# 
-# REVISION 89.23 - ASYMMETRIC TOPOLOGY HOTFIX
 #
-# BUGFIXES (Rev 89.23):
-# - TELEMETRY: Removed residual `WORKERS_PER_GPU` variable from the startup print
-#   statement. The asymmetric topography means workers are no longer symmetric 
-#   per GPU.
+# REVISION 89.27 - OBSERVABLE DRIFT (NON-DESTRUCTIVE TELEMETRY)
 #
-# BUGFIXES (Rev 89.22):
-# - ASYMMETRIC ROUTING (CRITICAL): Resolved OpenCL error -4 (Allocation Failure).
-#   The NVIDIA CMP 50HX (8GB) hard-crashes when VRAM is oversubscribed, whereas
-#   the AMD Pro VII (16GB) pages to GTT smoothly. The engine now assigns 22 patches 
-#   to GPU 0 (Workers 0,1,2) and exactly 5 patches to GPU 1 (Worker 3).
-# - ISOLATED ACE REPLICAS: `ACE_PROBE_PATCHES` is pinned to `[26]`, routing the 
-#   validation overhead entirely to Worker 3. Total GPU 1 footprint is capped at 
-#   ~7.4GB, preventing the CUDA memory manager from thrashing and failing.
+# BUGFIXES (Rev 89.27):
+# - C++ METADATA CORRUPTION (CRITICAL): `in_ket()` parsing a 1.07GB Python list takes 
+#   12+ minutes and permanently corrupts the ACE Schmidt-decomposition tree metadata, 
+#   causing fatal `Apply2x2` bounds-check crashes on subsequent Trotter steps. 
+# - ARCHITECTURAL PIVOT: Abandoned mid-run destructive sampling and state vector 
+#   reloads entirely. Continuous validation is now performed by calculating the 
+#   Root Mean Square Error (RMSE) of the local Pauli observables (Z, X, Y) between 
+#   the ACE replicas and the exact simulator. 
+# - FINAL STEP XEB: Actual destructive `measure_shots` sampling and `prob_perm` XEB 
+#   scoring is reserved exclusively for the final Trotter step (t == 99), providing 
+#   the golden RCS metric without ruining the mid-run state.
 #
-# BUGFIXES (Rev 89.21):
-# - NUMA STAGGER: Expanded the worker startup stagger from 4.0s to 15.0s per rank. 
-# - OBSERVABILITY: Added worker heartbeat prints as they awaken from the stagger.
-#
-# BUGFIXES (Rev 89.18 & older):
-# - Added `a.reset_unitary_fidelity()` to guarantee clean sliding-window epoch tracking.
-# - Abandoned non-destructive clones in favor of destructive measurement + `in_ket` resync.
+# BUGFIXES (Rev 89.26 & older):
+# - 6-GPU TOPOLOGY: Uniform saturation of 6x AMD Radeon Pro V340s.
+# - ALLOCATION STORM: Staggered worker startup by `rank * 10.0` seconds to prevent
+#   NUMA memory bus deadlock.
 
 import os
 import sys
@@ -50,9 +39,10 @@ GRID_X, GRID_Y, GRID_Z = 3, 3, 3
 TOTAL_PATCHES = GRID_X * GRID_Y * GRID_Z
 QUBITS_PER_PATCH = 27
 
-# Asymmetric Topography tuning
-GPUS_AVAILABLE = 2
-TOTAL_WORKERS = 4  # Workers 0,1,2 on GPU 0; Worker 3 on GPU 1
+# 6-GPU Symmetrical Topography
+GPUS_AVAILABLE = 6
+WORKERS_PER_GPU = 1  # 6 workers total (1 per AMD Radeon Pro V340)
+TOTAL_WORKERS = GPUS_AVAILABLE * WORKERS_PER_GPU
 
 # --- ACE CROSS-VALIDATION CONFIGURATION (ported from fc_ace.py) ---
 ACE_VALIDATION_ENABLED = True
@@ -60,7 +50,7 @@ ACE_N_INST = 2                                   # ACE replicas per probed patch
 ACE_SDRP = (1.0 - 1.0 / math.sqrt(2.0)) / 2.0    # fc_ace.py default (~0.1464466)
 ACE_SHOTS = 256                                  # samples pooled across replicas per validation
 ACE_VALIDATE_EVERY = 5                           # in units of *measure* steps
-ACE_PROBE_PATCHES = [26]                         # Routes exclusively to Worker 3 (NVIDIA CMP 50HX)
+ACE_PROBE_PATCHES = [17]                         # Routes exclusively to Worker 5
 ACE_MSB_FIRST = False                            # Toggle based on specific PyQrack build bit-ordering
 
 # =====================================================================
@@ -121,9 +111,9 @@ def gpu_worker_process(
     ace_cfg: Dict[str, Any]
 ) -> None:
     # Stagger worker startup to prevent NUMA memory bus contention 
-    # during massive simultaneous 27-qubit statevector allocations.
+    # during simultaneous statevector allocations across 6 GPUs.
     import time as _t
-    stagger_time = rank * 15.0
+    stagger_time = rank * 10.0
     if stagger_time > 0:
         _t.sleep(stagger_time)
     print(f"[Worker {rank}] Awakening after {stagger_time}s stagger... allocating statevectors.", flush=True)
@@ -131,16 +121,16 @@ def gpu_worker_process(
     os.environ["PYQRACK_SHARED_LIB_PATH"] = "/usr/local/lib/qrack/libqrack_pinvoke.so"
     os.environ["OCL_ICD_PLATFORM_SORT"] = "none"
 
-    # Asymmetric mapping: Rank 3 -> GPU 1 (NVIDIA); Ranks 0,1,2 -> GPU 0 (AMD)
-    physical_gpu_index = 1 if rank == 3 else 0
+    # Map multiple ranks to the same physical GPU device index
+    physical_gpu_index = rank // WORKERS_PER_GPU
     os.environ["QRACK_OCL_DEFAULT_DEVICE"] = str(physical_gpu_index)
 
     # Bind QPager to the assigned device to enable driver-level PCIe paging
     os.environ["QRACK_QPAGER_DEVICES"] = str(physical_gpu_index)
     os.environ["QRACK_QUNITMULTI_DEVICES"] = str(physical_gpu_index)
 
-    # Strict VRAM caps based on asymmetric topography
-    alloc_mb = 8000 if rank == 3 else 21000
+    # Strict VRAM caps based on physical 8GB per AMD Pro V340
+    alloc_mb = 8000 // WORKERS_PER_GPU
     os.environ["QRACK_MAX_ALLOC_MB"] = str(alloc_mb)
     os.environ["QRACK_DISABLE_QUNIT_FIDELITY_GUARD"] = "1"
 
@@ -419,33 +409,46 @@ def gpu_worker_process(
                             print(f"[Worker {rank}] Warning: sim.get_unitary_fidelity() not found. Upgrade PyQrack for true fidelity tracking.", file=sys.stderr)
                             _warned_fidelity = True
 
-                    # --- ACE SPARSE XEB/HOG VALIDATION ---
+                    # --- ACE SPARSE XEB/HOG & OBSERVABLE DRIFT VALIDATION ---
                     ace_xeb, ace_hog = None, None
+                    ace_z_rmse, ace_x_rmse, ace_y_rmse = None, None, None
+                    
                     if do_validate and patch_id in ace_sims:
                         t_start_ace_val = time.perf_counter()
                         try:
-                            shots_per = max(1, ace_cfg["shots"] // len(ace_sims[patch_id]))
+                            num_replicas = len(ace_sims[patch_id])
                             
-                            # Extract the exact statevector ONCE per validation step (~2GB)
-                            exact_ket = sim.out_ket()
+                            # 1. CONTINUOUS OBSERVABLE DRIFT (Non-Destructive)
+                            # To bypass destructive measurement and heavy `in_ket` Python list bottlenecks, 
+                            # we query the 1-local Pauli expectations directly and track the Root Mean Square 
+                            # Error (RMSE) of the ACE state's divergence from the exact state. 
+                            z_ace_avg = np.zeros(QUBITS_PER_PATCH)
+                            x_ace_avg = np.zeros(QUBITS_PER_PATCH)
+                            y_ace_avg = np.zeros(QUBITS_PER_PATCH)
                             
                             for a in ace_sims[patch_id]:
-                                # DESTRUCTIVE SAMPLING:
-                                samples = a.measure_shots(all_q, shots_per)
+                                z_ace_avg += z_means(a, all_q)
+                                x_ace_avg += x_means(a, all_q)
+                                y_ace_avg += y_means(a, all_q)
                                 
-                                # RESYNC:
-                                a.in_ket(exact_ket)
-                                
-                                if ace_cfg["sdrp"] > 0.0:
-                                    a.set_sdrp(ace_cfg["sdrp"])
-                                a.set_ace_max_qb((QUBITS_PER_PATCH + 1) >> 1)
-                                
-                                # Reset the C++ fidelity accumulator for the new epoch
-                                try:
-                                    a.reset_unitary_fidelity()
-                                except AttributeError:
-                                    pass
+                            z_ace_avg /= num_replicas
+                            x_ace_avg /= num_replicas
+                            y_ace_avg /= num_replicas
                             
+                            ace_z_rmse = float(np.sqrt(np.mean((state["Z"] - z_ace_avg)**2)))
+                            ace_x_rmse = float(np.sqrt(np.mean((state["X"] - x_ace_avg)**2)))
+                            ace_y_rmse = float(np.sqrt(np.mean((state["Y"] - y_ace_avg)**2)))
+                            
+                            # 2. FINAL STEP DESTRUCTIVE XEB
+                            # Perform the true overlap integral sampling exclusively on the final Trotter 
+                            # step, providing the golden RCS metric right before safe shutdown.
+                            if t == total_steps - 1:
+                                shots_per = max(1, ace_cfg["shots"] // num_replicas)
+                                samples = []
+                                
+                                for a in ace_sims[patch_id]:
+                                    samples.extend(a.measure_shots(all_q, shots_per))
+                                    
                                 ideal_p_list = []
                                 for o in samples:
                                     if ace_cfg["msb_first"]:
@@ -458,9 +461,6 @@ def gpu_worker_process(
                                     
                                 ideal_p = np.array(ideal_p_list, dtype=np.float64)
                                 ace_xeb, ace_hog = calc_sparse_stats(ideal_p, QUBITS_PER_PATCH)
-                                
-                            # Force host RAM reclamation
-                            del exact_ket
                             
                         except (AttributeError, TypeError, RuntimeError) as e:
                             if not _warned_ace:
@@ -485,6 +485,9 @@ def gpu_worker_process(
                         "unitary_fidelity": fidelity,
                         "ace_xeb": ace_xeb,
                         "ace_hog": ace_hog,
+                        "ace_z_rmse": ace_z_rmse,
+                        "ace_x_rmse": ace_x_rmse,
+                        "ace_y_rmse": ace_y_rmse,
                     }
 
             if is_measure:
@@ -534,15 +537,10 @@ class MultiGpuHadronEngine:
 
         self._init_files()
 
-        # Asymmetric Load Balancing
-        # GPU 0 (AMD Pro VII, 16GB) pages natively to system GTT. Handles Patches 0-21.
-        # GPU 1 (NVIDIA CMP 50HX, 8GB) crashes on overcommit. Handles Patches 22-26 + ACE replicas.
+        # Symmetric Load Balancing across 6 identical GPUs
         self.worker_assignments: List[List[int]] = [[] for _ in range(TOTAL_WORKERS)]
         for i in range(TOTAL_PATCHES):
-            if i < 22:
-                self.worker_assignments[i % 3].append(i) # Ranks 0,1,2 (GPU 0)
-            else:
-                self.worker_assignments[3].append(i)     # Rank 3 (GPU 1)
+            self.worker_assignments[i % TOTAL_WORKERS].append(i)
 
     def _init_files(self) -> None:
         try:
@@ -567,7 +565,7 @@ class MultiGpuHadronEngine:
                 ]).writeheader()
             with open(self.ace_csv, mode='w', newline='') as f:
                 csv.DictWriter(f, fieldnames=[
-                    "Step", "Patch", "XEB_ACE", "HOG_ACE"
+                    "Step", "Patch", "XEB_ACE", "HOG_ACE", "Z_RMSE", "X_RMSE", "Y_RMSE"
                 ]).writeheader()
         except Exception as e:
             print(f"[CSV] Warning: Setup configuration write failed: {e}", file=sys.stderr)
@@ -599,15 +597,22 @@ class MultiGpuHadronEngine:
         except Exception as e:
             print(f"[CSV] Warning: Log write failed: {e}", file=sys.stderr)
 
-    def _log_ace_csv(self, step: int, ace_records: List[Tuple[int, float, float]]) -> None:
+    def _log_ace_csv(self, step: int, ace_records: List[Tuple]) -> None:
         if not ace_records:
             return
         try:
             with open(self.ace_csv, mode='a', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=["Step", "Patch", "XEB_ACE", "HOG_ACE"])
-                for patch_id, xeb, hog in ace_records:
-                    w.writerow({"Step": step, "Patch": patch_id,
-                                "XEB_ACE": xeb, "HOG_ACE": hog})
+                w = csv.DictWriter(f, fieldnames=["Step", "Patch", "XEB_ACE", "HOG_ACE", "Z_RMSE", "X_RMSE", "Y_RMSE"])
+                for patch_id, xeb, hog, z_rmse, x_rmse, y_rmse in ace_records:
+                    w.writerow({
+                        "Step": step, 
+                        "Patch": patch_id,
+                        "XEB_ACE": xeb if xeb is not None else "", 
+                        "HOG_ACE": hog if hog is not None else "",
+                        "Z_RMSE": z_rmse if z_rmse is not None else "",
+                        "X_RMSE": x_rmse if x_rmse is not None else "",
+                        "Y_RMSE": y_rmse if y_rmse is not None else ""
+                    })
         except Exception as e:
             print(f"[CSV] Warning: ACE log write failed: {e}", file=sys.stderr)
 
@@ -634,7 +639,7 @@ class MultiGpuHadronEngine:
         print(f"[Engine] {TOTAL_PATCHES} patches, {total_qubits} qubits, {GPUS_AVAILABLE} GPUs ({TOTAL_WORKERS} workers total), {total_steps} steps")
         
         # Add a master notice about the expected boot delay so the user doesn't assume a hang.
-        print(f"[Master] Waiting for staggered worker initialization (expect ~{TOTAL_WORKERS * 15}s delay)...", flush=True)
+        print(f"[Master] Waiting for staggered worker initialization (expect ~{TOTAL_WORKERS * 10}s delay)...", flush=True)
         
         if ACE_VALIDATION_ENABLED:
             n_probe = TOTAL_PATCHES if ACE_PROBE_PATCHES is None else len(ACE_PROBE_PATCHES)
@@ -698,8 +703,16 @@ class MultiGpuHadronEngine:
                         max_lat_ace_evol = max(max_lat_ace_evol, payload.get("lat_ace_evol_ms", 0.0))
                         max_lat_ace_val = max(max_lat_ace_val, payload.get("lat_ace_val_ms", 0.0))
                         min_fidelity = min(min_fidelity, payload.get("unitary_fidelity", 1.0))
-                        if payload.get("ace_xeb") is not None:
-                            ace_records.append((patch_id, payload["ace_xeb"], payload["ace_hog"]))
+                        
+                        if payload.get("ace_z_rmse") is not None or payload.get("ace_xeb") is not None:
+                            ace_records.append((
+                                patch_id, 
+                                payload.get("ace_xeb"), 
+                                payload.get("ace_hog"),
+                                payload.get("ace_z_rmse"),
+                                payload.get("ace_x_rmse"),
+                                payload.get("ace_y_rmse")
+                            ))
 
                 if len(patch_full_states) != TOTAL_PATCHES:
                     raise RuntimeError(
@@ -809,10 +822,21 @@ class MultiGpuHadronEngine:
                 status = (f"Step {t:03d} | E: {total_energy:+.4f} | "
                           f"Lat(Trot/Tomo/ACE_ev/ACE_val): {max_lat_trotter:5.1f}/{max_lat_tomo:5.1f}/{max_lat_ace_evol:5.1f}/{max_lat_ace_val:5.1f}ms | "
                           f"Fid: {min_fidelity:.5f}")
+                          
                 if ace_records:
-                    mean_xeb = float(np.mean([r[1] for r in ace_records]))
-                    mean_hog = float(np.mean([r[2] for r in ace_records]))
-                    status += f" | XEB(ACE): {mean_xeb:+.4f} | HOG*(ACE): {mean_hog:.3f}"
+                    valid_xebs = [r[1] for r in ace_records if r[1] is not None]
+                    valid_hogs = [r[2] for r in ace_records if r[2] is not None]
+                    valid_z_rmse = [r[3] for r in ace_records if r[3] is not None]
+                    
+                    if valid_z_rmse:
+                        mean_z_rmse = float(np.mean(valid_z_rmse))
+                        status += f" | Z-RMSE(ACE): {mean_z_rmse:.4f}"
+                        
+                    if valid_xebs:
+                        mean_xeb = float(np.mean(valid_xebs))
+                        mean_hog = float(np.mean(valid_hogs))
+                        status += f" | XEB(ACE): {mean_xeb:+.4f} | HOG*(ACE): {mean_hog:.3f}"
+                        
                 status += f" | {time.perf_counter() - t0:.2f}s"
                 print(status)
 
