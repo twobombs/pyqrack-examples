@@ -1,9 +1,9 @@
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.5)
+# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.7)
 #
-# REVISION 90.5 - RCS ON TROTTER (Option 4)
+# REVISION 90.7 - RCS ON TROTTER (Option 4)
 #
 # ARCHITECTURE:
 # - RCS LAYER: At each RCS validation step, a random circuit of depth
@@ -27,12 +27,12 @@
 #   reversed and each gate replaced by its adjoint, restoring the exact 
 #   Trotter state mathematically (no approximation).
 #
-# BUGFIXES & INVARIANTS (Rev 90.5):
-# - measure_shots is protected by a runtime non-destructive smoke test 
-#   that identically mirrors the GPU/hybrid configuration of the main sim.
-# - Removed redundant U† -> U sequence. The flow is strictly:
-#   Apply RCS -> Sample -> Query prob_perm -> Apply Inverse.
-# - Unitary fidelity tracked (constant 1.0 for exact sim, reserved for SDRP).
+# BUGFIXES & UPGRADES (Rev 90.7):
+# - GPUS_AVAILABLE restored to 6 for the production hardware topography.
+# - measure_shots runtime smoke test upgraded to 27 qubits to guarantee
+#   the check traverses the identical multi-qubit code path as the main sim.
+# - Trotter step upgraded to True Strang Splitting: 
+#   Rx(1/2) -> Rz(1/2) -> ZZ(full) -> Rz(1/2) -> Rx(1/2).
 
 import os
 import sys
@@ -264,15 +264,17 @@ def gpu_worker_process(
         # ----------------------------------------------------------------
         # MEASURE_SHOTS DESTRUCTIVE SMOKE TEST
         # ----------------------------------------------------------------
+        # Scaled to full QUBITS_PER_PATCH to force the exact multi-qubit codepaths
+        # that will be used during the RCS sequences.
         _probe_nd = QrackSimulator(
-            qubit_count=1,
+            qubit_count=QUBITS_PER_PATCH,
             is_binary_decision_tree=False,
             is_stabilizer_hybrid=False,
             is_gpu=True,
         )
-        _probe_nd.h(0)
+        for _q in range(QUBITS_PER_PATCH): _probe_nd.h(_q)
         p_before = _probe_nd.prob(0)
-        _ = _probe_nd.measure_shots([0], 64)
+        _ = _probe_nd.measure_shots(list(range(QUBITS_PER_PATCH)), 64)
         p_after = _probe_nd.prob(0)
         if abs(p_before - p_after) > 0.01:
             raise RuntimeError("Fatal: measure_shots is destructive — RCS XEB invalid.")
@@ -290,12 +292,15 @@ def gpu_worker_process(
 
         def trotter_step_body(sim, num_qubits, edge_list, J, hx, hz, dt_local):
             dt_half = dt_local / 2.0
-            theta_x  = -2.0 * hx * dt_half
-            theta_z  = -2.0 * hz * dt_local
-            theta_zz = -J * dt_local
+            theta_x      = -2.0 * hx * dt_half
+            theta_z_half = -2.0 * hz * dt_half
+            theta_zz     = -J * dt_local
+            
+            # True Strang Splitting: Rx(1/2) -> Rz(1/2) -> ZZ(full) -> Rz(1/2) -> Rx(1/2)
             for q in range(num_qubits): apply_rx(sim, theta_x, q)
-            for q in range(num_qubits): apply_rz(sim, theta_z, q)
-            for q1, q2 in edge_list:   apply_zz(sim, theta_zz, q1, q2)
+            for q in range(num_qubits): apply_rz(sim, theta_z_half, q)
+            for q1, q2 in edge_list:    apply_zz(sim, theta_zz, q1, q2)
+            for q in range(num_qubits): apply_rz(sim, theta_z_half, q)
             for q in range(num_qubits): apply_rx(sim, theta_x, q)
 
         def z_means(sim, qubits):
