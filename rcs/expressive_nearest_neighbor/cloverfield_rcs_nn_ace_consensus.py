@@ -3,33 +3,27 @@
 # High-Throughput Volumetric Engine with Statistical Variance Injection
 # + Integrated ACE Cross-Validation (from Dan Strano's fc_ace.py NN-RCS harness)
 #
-# REVISION 89.10 - FINAL (Bulletproof Endianness Fallback & Log Consistency)
+# REVISION 89.13 - FINAL POLISH (Clone Flags & Exception Handling)
 #
-# BUGFIXES (Rev 89.10):
-# - BIT-ORDERING FALLBACK: The `TypeError` fallback for `prob_perm` now explicitly
-#   bit-reverses the integer if `ACE_MSB_FIRST` is True. Previously, the fallback
-#   silently bypassed the endianness toggle, which would ruin XEB scores if the
-#   list-signature binding failed.
-# - LOGGING CONSISTENCY: Aligned the `msb_first` namespace between the JSON config
-#   dump and the runtime worker config. Added a startup note clarifying that
-#   `ACE_val` latency reads 0.0 except on specific validation steps.
+# BUGFIXES (Rev 89.13):
+# - CLONE FLAGS: The `QrackSimulator(clone_sid=a.sid)` constructor now explicitly 
+#   passes `is_gpu=True`, `is_binary_decision_tree=False`, and `is_stabilizer_hybrid=False` 
+#   to match the source replica's Python-side metadata, preventing silent misdispatch.
+# - EXCEPTION HANDLING: Broadened the validation block exception guard to catch 
+#   `RuntimeError` (for C-level allocation failures) and structured the `a_clone`
+#   initialization to prevent `UnboundLocalError` if the constructor fails.
 #
-# BUGFIXES (Rev 89.9):
-# - BIT-ORDERING (SILENT BUG): Added global `ACE_MSB_FIRST` toggle to manage
-#   discrepancies between `measure_shots` output endianness and `prob_perm`
-#   input expectations.
-# - METRICS: Split the ambiguous ACE timer into `lat_ace_evol_ms` and `lat_ace_val_ms`.
-# - ARCHITECTURE NOTE: Documented the inherent 1-window lag in boundary field application.
+# BUGFIXES (Rev 89.12):
+# - CLONE API: Replaced the speculative `.clone()`/`init_clone` fallback chain
+#   with the officially documented `QrackSimulator(clone_sid=a.sid)` constructor.
+# - PROB_PERM SPEC: Removed the `TypeError` integer fallback. The docs explicitly
+#   state `prob_perm` takes a list of bools. Explicitly casted the bitmask to 
+#   `bool` types to strictly conform to the API contract.
 #
-# BUGFIXES (Rev 89.8):
-# - CLONE ALLOCATION (CRITICAL): The `init_clone` fallback passes `qubit_count=0`
-#   to prevent redundant backend allocation before reattaching the SID.
-# - KICK SCALING (LATENT): Gated boundary kick application behind `is_measure` to
-#   prevent quadratic over-rotation when `measure_every > 1`.
-#
-# BUGFIXES (Rev 89.7 & older):
-# - Non-destructive sampling via SID cloning and VRAM cleanup in `finally` blocks.
-# - Absolute eradication of shadowing variables (`p` -> `patch_id`).
+# BUGFIXES (Rev 89.11 & older):
+# - Reattached clone SID correctly to prevent out-of-bounds measurement crashes.
+# - Gated boundary kick application behind `is_measure` with accurate `time_delta`.
+# - Split `lat_ace_evol_ms` and `lat_ace_val_ms` for accurate profiling.
 
 import os
 import sys
@@ -419,12 +413,14 @@ def gpu_worker_process(
                             shots_per = max(1, ace_cfg["shots"] // len(ace_sims[patch_id]))
                             samples = []
                             for a in ace_sims[patch_id]:
-                                try:
-                                    a_clone = a.clone()
-                                except AttributeError:
-                                    new_sid = pyqrack.qrack_lib.init_clone(a.sid)
-                                    a_clone = pyqrack.QrackSimulator(qubit_count=0, sid=new_sid)
-                                    
+                                # NON-DESTRUCTIVE SAMPLING:
+                                # Officially documented `clone_sid` constructor preserves state.
+                                a_clone = pyqrack.QrackSimulator(
+                                    clone_sid=a.sid,
+                                    is_binary_decision_tree=False,
+                                    is_stabilizer_hybrid=False,
+                                    is_gpu=True,
+                                )
                                 try:
                                     samples.extend(a_clone.measure_shots(all_q, shots_per))
                                 finally:
@@ -432,28 +428,22 @@ def gpu_worker_process(
                             
                             ideal_p_list = []
                             for o in samples:
-                                try:
-                                    if ace_cfg["msb_first"]:
-                                        bitmask = [(int(o) >> (QUBITS_PER_PATCH - 1 - b)) & 1 for b in range(QUBITS_PER_PATCH)]
-                                    else:
-                                        bitmask = [(int(o) >> b) & 1 for b in range(QUBITS_PER_PATCH)]
-                                    p_val = sim.prob_perm(all_q, bitmask)
-                                except TypeError:
-                                    # Fallback integer bitfield. Explicitly bit-reverse if msb_first to respect the toggle.
-                                    if ace_cfg["msb_first"]:
-                                        reversed_o = sum(((int(o) >> b) & 1) << (QUBITS_PER_PATCH - 1 - b) for b in range(QUBITS_PER_PATCH))
-                                        p_val = sim.prob_perm(all_q, reversed_o)
-                                    else:
-                                        p_val = sim.prob_perm(all_q, int(o))
+                                if ace_cfg["msb_first"]:
+                                    bitmask = [bool((int(o) >> (QUBITS_PER_PATCH - 1 - b)) & 1) for b in range(QUBITS_PER_PATCH)]
+                                else:
+                                    bitmask = [bool((int(o) >> b) & 1) for b in range(QUBITS_PER_PATCH)]
+                                
+                                p_val = sim.prob_perm(all_q, bitmask)
                                 ideal_p_list.append(p_val)
                                 
                             ideal_p = np.array(ideal_p_list, dtype=np.float64)
                             ace_xeb, ace_hog = calc_sparse_stats(ideal_p, QUBITS_PER_PATCH)
                             
-                        except (AttributeError, TypeError) as e:
+                        except (AttributeError, TypeError, RuntimeError) as e:
                             if not _warned_ace:
                                 print(f"[Worker {rank}] Warning: sparse validation bindings "
-                                      f"unavailable or signature mismatched ({e}). Disabling ACE cross-validation.",
+                                      f"unavailable, signature mismatched, or allocation failed ({e}). "
+                                      f"Disabling ACE cross-validation.",
                                       file=sys.stderr)
                                 _warned_ace = True
                             ace_enabled = False
