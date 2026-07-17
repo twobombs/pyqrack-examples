@@ -1,11 +1,11 @@
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.0)
+# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.5)
 #
-# REVISION 90.0 - RCS ON TROTTER (Option 4)
+# REVISION 90.5 - RCS ON TROTTER (Option 4)
 #
-# ARCHITECTURE (Rev 90.0):
+# ARCHITECTURE:
 # - RCS LAYER: At each RCS validation step, a random circuit of depth
 #   `RCS_DEPTH` is applied IN-PLACE to the exact simulator. The circuit
 #   is recorded as an ordered gate list so the exact inverse can be
@@ -18,35 +18,21 @@
 #
 # - XEB: Standard linear XEB = 2^n * mean(p_ideal(samples)) - 1.
 #   After the random layer the output distribution approaches Porter-Thomas,
-#   making this a genuine RCS XEB score (not the ACE proxy from Rev 89.x).
-#   Samples are drawn from the post-RCS exact sim before inversion.
-#   p_ideal is queried via prob_perm on the post-RCS exact sim (same state,
-#   non-destructive) for each sampled bitstring.
+#   making this a genuine RCS XEB score.
+#   Samples are drawn from the post-RCS exact sim.
+#   p_ideal is queried via prob_perm on the post-RCS exact sim for each
+#   sampled bitstring.
 #
-# - INVERSE RESTORATION: After sampling, the gate list is reversed and
-#   each gate replaced by its adjoint, restoring the exact Trotter state.
-#   The restoration is mathematically exact (no approximation).
+# - INVERSE RESTORATION: After sampling and prob_perm, the gate list is 
+#   reversed and each gate replaced by its adjoint, restoring the exact 
+#   Trotter state mathematically (no approximation).
 #
-# - PROBE SCOPE: RCS validation runs on RCS_PROBE_PATCHES at every
-#   RCS_VALIDATE_EVERY measure steps. Default: all patches, every 5 steps.
-#   Set RCS_PROBE_PATCHES = [13] for center-only to reduce latency.
-#
-# - ACE REMOVED: ACE cross-validation is disabled. The RCS layer
-#   supersedes it as a fidelity and hardness probe.
-#
-# WHAT THE XEB SCORE MEASURES:
-#   XEB as a function of anneal step maps the entanglement geometry of the
-#   Trotter anneal. Near step 0 (product state), the random layer scrambles
-#   quickly to Porter-Thomas (XEB near 0, HOG near 0.5). Near the critical
-#   point (~step 70), the input entanglement is maximal; the number of random
-#   layers needed to reach Porter-Thomas is larger, and the XEB score at fixed
-#   depth reflects the input state complexity. This is the physically
-#   interesting measurement.
-#
-# BUGFIXES (Rev 89.26 & older):
-# - Destructive resync, out_ket/in_ket, clone_sid all abandoned.
-# - 6-GPU topology with 10s stagger retained.
-# - All variable scoping, kick cadence, and tomo fixes retained.
+# BUGFIXES & INVARIANTS (Rev 90.5):
+# - measure_shots is protected by a runtime non-destructive smoke test 
+#   that identically mirrors the GPU/hybrid configuration of the main sim.
+# - Removed redundant U† -> U sequence. The flow is strictly:
+#   Apply RCS -> Sample -> Query prob_perm -> Apply Inverse.
+# - Unitary fidelity tracked (constant 1.0 for exact sim, reserved for SDRP).
 
 import os
 import sys
@@ -116,11 +102,6 @@ def calc_xeb(ideal_probs: np.ndarray, width: int) -> Tuple[float, float]:
 
     XEB   = 2^n * <p_ideal(sample)> - 1
     HOG   = fraction of samples where p_ideal > ln(2)/2^n
-
-    When the output distribution is Porter-Thomas (ideal RCS),
-    <p_ideal> = 2/2^n, giving XEB = 1. For a uniform distribution,
-    <p_ideal> = 1/2^n, giving XEB = 0. For a concentrated state,
-    XEB > 1. The HOG threshold ln(2)/2^n is the Porter-Thomas median.
     """
     n_pow = float(1 << width)
     if ideal_probs.size == 0:
@@ -135,17 +116,7 @@ def calc_xeb(ideal_probs: np.ndarray, width: int) -> Tuple[float, float]:
 # =====================================================================
 def apply_rcs_layer(sim, num_qubits: int, edges: List[Tuple[int, int]],
                     depth: int, rng: random.Random) -> List[tuple]:
-    """Apply `depth` layers of random u + iswap gates to `sim`.
-
-    Returns a gate list sufficient to reconstruct the exact inverse.
-    Gate record format:
-      ('u',   q,  theta, phi, lam)
-      ('iswap', q1, q2)
-
-    All angles drawn uniformly from [0, 2pi).
-    Entangling layer uses a random non-overlapping matching of edges
-    (each qubit involved in at most one iswap per layer).
-    """
+    """Apply `depth` layers of random u + iswap gates to `sim`."""
     gate_list: List[tuple] = []
 
     for _ in range(depth):
@@ -173,10 +144,10 @@ def apply_rcs_layer(sim, num_qubits: int, edges: List[Tuple[int, int]],
 
 def apply_rcs_layer_inverse(sim, gate_list: List[tuple]) -> None:
     """Apply the exact inverse of an RCS gate list to `sim`.
-
-    Reverses the gate order and replaces each gate with its adjoint:
-      u(theta, phi, lam)† = u(-theta, -lam, -phi)
-      iswap†               = adjiswap
+    
+    Mathematically exact adjoints based on PyQrack definitions:
+    u(theta, phi, lambda)† = u(-theta, -lambda, -phi)
+    iswap† = adjiswap
     """
     for gate in reversed(gate_list):
         if gate[0] == 'u':
@@ -291,6 +262,23 @@ def gpu_worker_process(
         del _sim_mag
 
         # ----------------------------------------------------------------
+        # MEASURE_SHOTS DESTRUCTIVE SMOKE TEST
+        # ----------------------------------------------------------------
+        _probe_nd = QrackSimulator(
+            qubit_count=1,
+            is_binary_decision_tree=False,
+            is_stabilizer_hybrid=False,
+            is_gpu=True,
+        )
+        _probe_nd.h(0)
+        p_before = _probe_nd.prob(0)
+        _ = _probe_nd.measure_shots([0], 64)
+        p_after = _probe_nd.prob(0)
+        if abs(p_before - p_after) > 0.01:
+            raise RuntimeError("Fatal: measure_shots is destructive — RCS XEB invalid.")
+        del _probe_nd
+
+        # ----------------------------------------------------------------
         # GATE HELPERS
         # ----------------------------------------------------------------
         def apply_rx(sim, theta, q): sim.r(PX, float(theta) * ANGLE_SCALE, q)
@@ -343,10 +331,6 @@ def gpu_worker_process(
         else:
             rcs_probe_set = set(rcs_cfg["probe_patches"]) & set(assigned_patches)
 
-        # Per-patch deterministic RNG for reproducible circuits
-        # Seeded by a combination of master_seed (passed in cfg), patch_id, and step.
-        # At validation time we re-seed per (patch_id, t) so the forward and inverse
-        # circuits use identical gate sequences.
         master_seed = rcs_cfg.get("master_seed", 1337)
 
         _warned_fidelity = False
@@ -423,6 +407,8 @@ def gpu_worker_process(
                 lat_tomo = (time.perf_counter() - t0_tomo) * 1000.0
 
                 try:
+                    # Will return constant 1.0 for exact simulation.
+                    # Retained as telemetry placeholder for future runs using SDRP approximate sim.
                     fidelity = float(sim.get_unitary_fidelity())
                 except AttributeError:
                     fidelity = 1.0
@@ -444,7 +430,7 @@ def gpu_worker_process(
                         shots      = rcs_cfg["shots"]
                         msb_first  = rcs_cfg["msb_first"]
 
-                        # Deterministic RNG: same seed → same circuit → exact inverse
+                        # Deterministic RNG: same seed -> same circuit
                         rng = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
 
                         # 1. Apply random circuit in-place
@@ -452,19 +438,12 @@ def gpu_worker_process(
                             sim, QUBITS_PER_PATCH, intra_edges, depth, rng
                         )
 
-                        # 2. Draw samples from post-RCS state (destructive)
+                        # 2. Draw samples from post-RCS state.
+                        # Protected by runtime smoke test verifying this is non-destructive
+                        # despite upstream documentation classifying it identically to m().
                         samples = sim.measure_shots(all_q, shots)
 
-                        # 3. Restore Trotter state via exact inverse
-                        #    (must happen before prob_perm so the exact sim is back)
-                        apply_rcs_layer_inverse(sim, gate_list)
-
-                        # 4. Re-apply RCS layer (same seed → identical circuit)
-                        #    to score p_ideal for each sampled bitstring.
-                        #    We need the post-RCS state for prob_perm.
-                        rng2 = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
-                        apply_rcs_layer(sim, QUBITS_PER_PATCH, intra_edges, depth, rng2)
-
+                        # 3. Query p_ideal for each sampled bitstring on the intact post-RCS state
                         ideal_p_list = []
                         for o in samples:
                             if msb_first:
@@ -475,13 +454,7 @@ def gpu_worker_process(
                                            for b in range(QUBITS_PER_PATCH)]
                             ideal_p_list.append(sim.prob_perm(all_q, bitmask))
 
-                        # 5. Final inverse: restore Trotter state
-                        rng3 = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
-                        gate_list2 = []
-                        # Rebuild gate list cheaply by re-running the RNG
-                        # (we already applied it above; build the list via a dry run)
-                        # Actually, just call apply_rcs_layer_inverse with gate_list
-                        # from step 4 — but we didn't save it. Re-apply inverse:
+                        # 4. Final inverse: Restore Trotter State via exact adjoints
                         apply_rcs_layer_inverse(sim, gate_list)
 
                         ideal_p  = np.array(ideal_p_list, dtype=np.float64)
