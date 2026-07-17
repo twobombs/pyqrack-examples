@@ -181,7 +181,7 @@ def bench_qrack(width, depth, sdrp=0.0):
     n_inst       = 4
     n_pow        = 1 << width
     u_u          = 1.0 / n_pow
-    shots        = 1 << min(8, width + 2)
+    shots        = 1 << min(10, width + 2)
     shots_per    = shots // n_inst
     shots        = shots_per * n_inst
 
