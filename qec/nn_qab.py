@@ -211,7 +211,6 @@ def bench_qrack(width, depth, sdrp):
         "xeb_ace":         xeb_ace,
         "hog_ace":         hog_ace,
         "inverse_xeb_ace": ixeb_ace,
-        "2-tail_xeb":      (xeb_ace + ixeb_ace) / 2
     }
 
 
