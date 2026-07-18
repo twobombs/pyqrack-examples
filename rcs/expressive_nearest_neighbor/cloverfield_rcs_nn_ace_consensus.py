@@ -1,9 +1,9 @@
-# -*- coding: utf-8 -*-
+# -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.7)
+# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.8)
 #
-# REVISION 90.7 - RCS ON TROTTER (Option 4)
+# REVISION 90.8 - RCS ON TROTTER (Option 4)
 #
 # ARCHITECTURE:
 # - RCS LAYER: At each RCS validation step, a random circuit of depth
@@ -27,8 +27,10 @@
 #   reversed and each gate replaced by its adjoint, restoring the exact 
 #   Trotter state mathematically (no approximation).
 #
-# BUGFIXES & UPGRADES (Rev 90.7):
-# - GPUS_AVAILABLE restored to 6 for the production hardware topography.
+# BUGFIXES & UPGRADES (Rev 90.8):
+# - GPUS_AVAILABLE locked to 6 for the V340 array topography.
+# - RCS_PROBE_PATCHES restricted to [13] (center patch) to bypass prob_perm 
+#   iteration bottleneck while providing maximal signal-to-noise on boundary kicks.
 # - measure_shots runtime smoke test upgraded to 27 qubits to guarantee
 #   the check traverses the identical multi-qubit code path as the main sim.
 # - Trotter step upgraded to True Strang Splitting: 
@@ -62,7 +64,7 @@ RCS_VALIDATION_ENABLED = True
 RCS_DEPTH = 20                # Random circuit depth (layers of u + iswap)
 RCS_SHOTS = 256               # Samples drawn from post-RCS state per probe patch
 RCS_VALIDATE_EVERY = 5        # In units of measure steps
-RCS_PROBE_PATCHES = None      # None = all patches; [13] = center only
+RCS_PROBE_PATCHES = [13]      # [13] = Center patch only to prevent prob_perm bottlenecks
 
 # Bit-ordering convention for prob_perm bitmask construction.
 # False = LSB-first (qubit 0 = bit 0 of the integer outcome).
@@ -147,8 +149,8 @@ def apply_rcs_layer_inverse(sim, gate_list: List[tuple]) -> None:
     """Apply the exact inverse of an RCS gate list to `sim`.
     
     Mathematically exact adjoints based on PyQrack definitions:
-    u(theta, phi, lambda)† = u(-theta, -lambda, -phi)
-    iswap† = adjiswap
+    u(theta, phi, lambda)^dag = u(-theta, -lambda, -phi)
+    iswap^dag = adjiswap
     """
     for gate in reversed(gate_list):
         if gate[0] == 'u':
@@ -278,7 +280,7 @@ def gpu_worker_process(
         _ = _probe_nd.measure_shots(list(range(QUBITS_PER_PATCH)), 64)
         p_after = _probe_nd.prob(0)
         if abs(p_before - p_after) > 0.01:
-            raise RuntimeError("Fatal: measure_shots is destructive — RCS XEB invalid.")
+            raise RuntimeError("Fatal: measure_shots is destructive - RCS XEB invalid.")
         del _probe_nd
 
         # ----------------------------------------------------------------
@@ -474,7 +476,7 @@ def gpu_worker_process(
                     lat_rcs = (time.perf_counter() - t0_rcs) * 1000.0
 
                 patch_data[patch_id] = {
-                    "state":                state,
+                    "state":                 state,
                     "meanfield_bulk_energy": bulk_e,
                     "lat_trotter_ms":        lat_trotter,
                     "lat_tomo_ms":           lat_tomo,
@@ -644,7 +646,7 @@ class MultiGpuHadronEngine:
         n_probe = TOTAL_PATCHES if RCS_PROBE_PATCHES is None else len(RCS_PROBE_PATCHES)
         print(f"[Engine] {TOTAL_PATCHES} patches, {TOTAL_PATCHES * QUBITS_PER_PATCH} qubits, "
               f"{GPUS_AVAILABLE} GPUs, {total_steps} steps")
-        print(f"[Master] Staggered init — expect ~{TOTAL_WORKERS * 10}s before first output.",
+        print(f"[Master] Staggered init - expect ~{TOTAL_WORKERS * 10}s before first output.",
               flush=True)
         if RCS_VALIDATION_ENABLED:
             print(f"[Engine] RCS ON: depth={RCS_DEPTH}, shots={RCS_SHOTS}, "
