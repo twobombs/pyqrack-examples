@@ -1,20 +1,21 @@
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place RCS Layer with Exact Ket Restoration (Rev 97)
+# + In-Place RCS Layer with Exact Ket Restoration (Rev 99)
 #
-# REVISION 97 - DETERMINISTIC RAM CLEANUP & PRODUCTION HARDENING
+# REVISION 99 - IPC SCHEMA UPGRADE & PROFILING ISOLATION
 #
 # ARCHITECTURE:
 # - RCS LAYER: In-place random circuit applied directly to Trotter state.
 #   State is perfectly preserved via out_ket() / in_ket() wrapping.
 #
-# - FAIL-SAFE RESTORATION: RCS block is wrapped in try/finally to ensure
-#   the pristine ket is restored and the 3GB host memory footprint 
-#   (2GB ket + 1GB probs) is deterministically freed even on exception paths.
+# - IPC DELEGATION: Worker computes exact mathematical variance for Pauli
+#   observables (1 - <P>^2) and sends discrete `var_X/Y/Z` arrays, readying 
+#   the engine for drop-in native PyQrack hardware-noise estimators.
 #
-# - API CONTRACT VERIFICATION: Worker explicitly verifies PyQrack's
-#   measure_shots LSB/MSB indexing convention against out_probs() at boot.
+# - PROFILING ISOLATION: lat_rcs strictly bounds the random circuit logic,
+#   excluding gc.collect() and in_ket() DMA restore time to provide true 
+#   algorithmic telemetry.
 
 import os
 import sys
@@ -34,7 +35,7 @@ GRID_X, GRID_Y, GRID_Z = 3, 3, 3
 TOTAL_PATCHES  = GRID_X * GRID_Y * GRID_Z
 QUBITS_PER_PATCH = 27
 
-# 6-GPU Symmetrical Topography (AMD Radeon Pro V340 x3 = 6 dies)
+# 6-GPU Symmetrical Topography
 GPUS_AVAILABLE  = 6
 WORKERS_PER_GPU = 1          # DO NOT set to 2: rusticl falls back to CPU per die
 TOTAL_WORKERS   = GPUS_AVAILABLE * WORKERS_PER_GPU
@@ -351,11 +352,22 @@ def gpu_worker_process(
                     continue
 
                 t0_tomo = time.perf_counter()
+                
+                # Fetch exact expectation values
+                x_exp = x_means(sim, all_q)
+                y_exp = y_means(sim, all_q)
+                z_exp = z_means(sim, all_q)
+                
                 state = {
-                    "Z": z_means(sim, all_q),
-                    "X": x_means(sim, all_q),
-                    "Y": y_means(sim, all_q),
+                    "X": x_exp,
+                    "Y": y_exp,
+                    "Z": z_exp,
+                    # Exact variance mapping Var(P) = 1 - <P>^2
+                    "var_X": np.clip(1.0 - x_exp**2, 0.0, 1.0),
+                    "var_Y": np.clip(1.0 - y_exp**2, 0.0, 1.0),
+                    "var_Z": np.clip(1.0 - z_exp**2, 0.0, 1.0),
                 }
+                
                 zz_exp = zz_means_mf(state["Z"], intra_edges)
                 bulk_e = (
                     -current_hz * float(np.sum(state["Z"]))
@@ -392,14 +404,18 @@ def gpu_worker_process(
                         # 2. Apply random circuit in-place
                         apply_rcs_layer(sim, QUBITS_PER_PATCH, intra_edges, depth, rng)
 
-                        # 3. Single DMA burst: full 2^27 probability vector (~1GB)
+                        # 3. Single DMA burst: full 2^27 probability vector
                         all_probs = np.array(sim.out_probs(), dtype=np.float64)
 
                         # 4. Draw samples and pull probabilities exactly
                         samples = sim.measure_shots(all_q, shots)
                         ideal_p = np.array([all_probs[int(o)] for o in samples], dtype=np.float64)
                         
+                        # Note: XEB here measures the combined Trotter fidelity drift + RCS complexity
                         rcs_xeb, rcs_hog = calc_xeb(ideal_p, QUBITS_PER_PATCH)
+
+                        # Isolate actual algorithmic time from clean-up delays
+                        lat_rcs = (time.perf_counter() - t0_rcs) * 1000.0
 
                         if is_snapshot:
                             print(f"[Worker {rank}] Snapshot RCS patch {patch_id}: "
@@ -413,6 +429,7 @@ def gpu_worker_process(
                         # 5. Fail-safe RAM clean-up and state restoration
                         if all_probs is not None:
                             del all_probs
+                            gc.collect() # Nudge OS to reclaim memory block
                             
                         if pristine_ket is not None:
                             try:
@@ -422,8 +439,6 @@ def gpu_worker_process(
                                       file=sys.stderr)
                             finally:
                                 del pristine_ket
-
-                    lat_rcs = (time.perf_counter() - t0_rcs) * 1000.0
 
                 patch_data[patch_id] = {
                     "state":                  state,
@@ -697,9 +712,9 @@ class MultiGpuHadronEngine:
                             "Z": state["Z"][bq],
                         },
                         "vars": {
-                            "X": np.clip(1.0 - state["X"][bq]**2, 0.0, 1.0),
-                            "Y": np.clip(1.0 - state["Y"][bq]**2, 0.0, 1.0),
-                            "Z": np.clip(1.0 - state["Z"][bq]**2, 0.0, 1.0),
+                            "X": state["var_X"][bq],
+                            "Y": state["var_Y"][bq],
+                            "Z": state["var_Z"][bq],
                         },
                     }
 
