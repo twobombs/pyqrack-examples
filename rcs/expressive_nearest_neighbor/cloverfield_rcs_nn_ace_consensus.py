@@ -1,9 +1,9 @@
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.8)
+# + In-Place RCS Layer with Inverse-Circuit Restoration (Rev 90.9)
 #
-# REVISION 90.8 - RCS ON TROTTER (Option 4)
+# REVISION 90.9 - DMA BURST BATCHING
 #
 # ARCHITECTURE:
 # - RCS LAYER: At each RCS validation step, a random circuit of depth
@@ -19,22 +19,16 @@
 # - XEB: Standard linear XEB = 2^n * mean(p_ideal(samples)) - 1.
 #   After the random layer the output distribution approaches Porter-Thomas,
 #   making this a genuine RCS XEB score.
-#   Samples are drawn from the post-RCS exact sim.
-#   p_ideal is queried via prob_perm on the post-RCS exact sim for each
-#   sampled bitstring.
 #
-# - INVERSE RESTORATION: After sampling and prob_perm, the gate list is 
-#   reversed and each gate replaced by its adjoint, restoring the exact 
-#   Trotter state mathematically (no approximation).
+# - INVERSE RESTORATION: After sampling, the gate list is reversed and 
+#   each gate replaced by its adjoint, restoring the exact Trotter state.
 #
-# BUGFIXES & UPGRADES (Rev 90.8):
+# BUGFIXES & UPGRADES (Rev 90.9):
 # - GPUS_AVAILABLE locked to 6 for the V340 array topography.
-# - RCS_PROBE_PATCHES restricted to [13] (center patch) to bypass prob_perm 
-#   iteration bottleneck while providing maximal signal-to-noise on boundary kicks.
-# - measure_shots runtime smoke test upgraded to 27 qubits to guarantee
-#   the check traverses the identical multi-qubit code path as the main sim.
-# - Trotter step upgraded to True Strang Splitting: 
-#   Rx(1/2) -> Rz(1/2) -> ZZ(full) -> Rz(1/2) -> Rx(1/2).
+# - RCS_PROBE_PATCHES restricted to [13] (center patch) for max signal.
+# - BOTTLENECK ELIMINATED: Replaced 256 serial prob_perm calls with a 
+#   single sim.out_probs() 512MB DMA readback. Indexing happens directly 
+#   on the host, keeping the GPU P-state high and bypassing rusticl lag.
 
 import os
 import sys
@@ -64,10 +58,9 @@ RCS_VALIDATION_ENABLED = True
 RCS_DEPTH = 20                # Random circuit depth (layers of u + iswap)
 RCS_SHOTS = 256               # Samples drawn from post-RCS state per probe patch
 RCS_VALIDATE_EVERY = 5        # In units of measure steps
-RCS_PROBE_PATCHES = [13]      # [13] = Center patch only to prevent prob_perm bottlenecks
+RCS_PROBE_PATCHES = [13]      # [13] = Center patch only
 
-# Bit-ordering convention for prob_perm bitmask construction.
-# False = LSB-first (qubit 0 = bit 0 of the integer outcome).
+# Bit-ordering convention for legacy bits, kept for config compatibility
 RCS_MSB_FIRST = False
 
 # =====================================================================
@@ -267,8 +260,6 @@ def gpu_worker_process(
         # ----------------------------------------------------------------
         # MEASURE_SHOTS DESTRUCTIVE SMOKE TEST
         # ----------------------------------------------------------------
-        # Scaled to full QUBITS_PER_PATCH to force the exact multi-qubit codepaths
-        # that will be used during the RCS sequences.
         _probe_nd = QrackSimulator(
             qubit_count=QUBITS_PER_PATCH,
             is_binary_decision_tree=False,
@@ -436,7 +427,6 @@ def gpu_worker_process(
                     try:
                         depth      = rcs_cfg["depth"]
                         shots      = rcs_cfg["shots"]
-                        msb_first  = rcs_cfg["msb_first"]
 
                         # Deterministic RNG: same seed -> same circuit
                         rng = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
@@ -446,21 +436,12 @@ def gpu_worker_process(
                             sim, QUBITS_PER_PATCH, intra_edges, depth, rng
                         )
 
-                        # 2. Draw samples from post-RCS state.
-                        # Protected by runtime smoke test verifying this is non-destructive
-                        # despite upstream documentation classifying it identically to m().
-                        samples = sim.measure_shots(all_q, shots)
+                        # 2. Pull full probability vector once (512MB DMA readback)
+                        all_probs = np.array(sim.out_probs(), dtype=np.float64)
 
-                        # 3. Query p_ideal for each sampled bitstring on the intact post-RCS state
-                        ideal_p_list = []
-                        for o in samples:
-                            if msb_first:
-                                bitmask = [bool((int(o) >> (QUBITS_PER_PATCH - 1 - b)) & 1)
-                                           for b in range(QUBITS_PER_PATCH)]
-                            else:
-                                bitmask = [bool((int(o) >> b) & 1)
-                                           for b in range(QUBITS_PER_PATCH)]
-                            ideal_p_list.append(sim.prob_perm(all_q, bitmask))
+                        # 3. Draw samples and index directly
+                        samples = sim.measure_shots(all_q, shots)
+                        ideal_p_list = [all_probs[int(o)] for o in samples]
 
                         # 4. Final inverse: Restore Trotter State via exact adjoints
                         apply_rcs_layer_inverse(sim, gate_list)
@@ -546,7 +527,6 @@ class MultiGpuHadronEngine:
                     "rcs_shots": RCS_SHOTS,
                     "rcs_validate_every": RCS_VALIDATE_EVERY,
                     "rcs_probe_patches": RCS_PROBE_PATCHES,
-                    "rcs_msb_first": RCS_MSB_FIRST,
                 }, f)
             with open(self.energy_csv, 'w', newline='') as f:
                 csv.DictWriter(f, fieldnames=[
@@ -637,7 +617,6 @@ class MultiGpuHadronEngine:
             "shots":          RCS_SHOTS,
             "validate_every": RCS_VALIDATE_EVERY,
             "probe_patches":  RCS_PROBE_PATCHES,
-            "msb_first":      RCS_MSB_FIRST,
             "target_hx":      target_hx,
             "target_hz":      target_hz,
             "master_seed":    self.master_seed,
