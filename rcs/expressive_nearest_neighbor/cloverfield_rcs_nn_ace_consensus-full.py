@@ -46,7 +46,7 @@ RCS_DEPTH               = 20
 RCS_SHOTS               = 256
 RCS_VALIDATE_EVERY      = 5        # normal cadence: probe patch 13 every 5 steps
 RCS_PROBE_PATCHES       = [13]     # center patch for routine validation
-RCS_FULL_SNAPSHOT_STEPS = [42, 99] # all-patch RCS: phase transition + final
+RCS_FULL_SNAPSHOT_STEPS = [42, 82, 99] # all-patch RCS: phase transition + final
 
 # =====================================================================
 # ENVIRONMENT
