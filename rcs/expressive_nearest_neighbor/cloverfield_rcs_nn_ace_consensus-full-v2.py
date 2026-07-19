@@ -1,0 +1,895 @@
+# -*- coding: us-ascii -*-
+# 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
+# High-Throughput Volumetric Engine with Statistical Variance Injection
+# + In-Place RCS Layer with Exact Ket Restoration (Rev 117)
+#
+# REVISION 117 - DOUBLE-KET TRUE PORTER-THOMAS XEB & MEMORY LEAK PLUG
+#
+# ARCHITECTURE:
+# - RCS LAYER: In-place random circuit applied directly to Trotter state.
+#   State is perfectly preserved via out_ket() / in_ket() wrapping. 
+#   A secondary double-ket buffer (`rcs_ket`) is used to temporarily hold 
+#   the RCS superposition, allowing destructive measure_shots() to sample 
+#   the true distribution before reverting for exact prob_perm() queries.
+#   Both kets are strictly managed with nested try/finally blocks to prevent
+#   multi-gigabyte host RAM leaks during simulator exceptions.
+#
+# - PROBE ROTATION: Routine RCS validation is distributed by the workers 
+#   themselves to guarantee 100% GPU utilization, rotating through the 
+#   entire lattice to ensure comprehensive XEB coverage over time.
+#
+# - IPC DELEGATION: Worker computes exact mathematical variance for Pauli
+#   observables (1 - <P>^2) and sends discrete `var_X/Y/Z` arrays. Master
+#   polls with a 300-second watchdog to accommodate JIT compilation overhead.
+#
+# - DATA STREAMING: Engine safely outputs arbitrarily long runs by rotating
+#   CSV data and macroscopic state arrays (.npy) into discrete chunked files.
+
+import os
+import sys
+import gc
+import csv
+import json
+import time
+import math
+import random
+import numpy as np
+import multiprocessing as mp
+import multiprocessing.connection
+from typing import List, Tuple, Dict, Any, Optional
+
+# --- GLOBAL CONFIGURATION ---
+GRID_X, GRID_Y, GRID_Z = 3, 3, 3
+TOTAL_PATCHES  = GRID_X * GRID_Y * GRID_Z
+QUBITS_PER_PATCH = 27
+
+# 6-GPU Symmetrical Topography
+GPUS_AVAILABLE  = 6
+WORKERS_PER_GPU = 1          # DO NOT set to 2: rusticl falls back to CPU per die
+TOTAL_WORKERS   = GPUS_AVAILABLE * WORKERS_PER_GPU
+
+# --- RCS CONFIGURATION ---
+RCS_VALIDATION_ENABLED  = True
+RCS_DEPTH               = 20
+RCS_SHOTS               = 256
+RCS_VALIDATE_EVERY      = 5        # normal cadence: probe every 5 measure steps
+RCS_PROBES_PER_WORKER   = 1        # probes per GPU per routine round (6 GPUs -> 6 patches)
+RCS_PROBE_ROTATE        = True     # rotate probe through each worker's patch set
+RCS_FULL_SNAPSHOT_STEPS = [42, 82, 99] # all-patch RCS: phase transition + final
+
+# --- LOGGING CONFIGURATION ---
+CSV_CHUNK_SIZE          = 50       # Rotate to a new CSV file every 50 steps
+STATE_CHUNK_SIZE        = 10       # Save and clear macroscopic state arrays every 10 steps
+CSV_CHUNK_DIGITS        = 4        # Zero-padding for CSV chunk numbers
+STATE_CHUNK_DIGITS      = 4        # Zero-padding for NPY chunk numbers
+
+# =====================================================================
+# ENVIRONMENT
+# =====================================================================
+os.environ["QRACK_DISABLE_QUNIT_FIDELITY_GUARD"] = "1"
+
+# =====================================================================
+# PURE FUNCTIONS
+# =====================================================================
+def generate_27q_lattice_subvolume() -> Tuple[List[Tuple[int, int]], Dict[str, List[int]]]:
+    lx, ly, lz = 3, 3, 3
+    edges: List[Tuple[int, int]] = []
+    boundaries: Dict[str, List[int]] = {
+        "+X": [], "-X": [], "+Y": [], "-Y": [], "+Z": [], "-Z": []
+    }
+    for x in range(lx):
+        for y in range(ly):
+            for z in range(lz):
+                idx = x * (ly * lz) + y * lz + z
+                if x < lx - 1: edges.append((idx, (x + 1) * (ly * lz) + y * lz + z))
+                if y < ly - 1: edges.append((idx, x * (ly * lz) + (y + 1) * lz + z))
+                if z < lz - 1: edges.append((idx, x * (ly * lz) + y * lz + (z + 1)))
+                if x == 0:      boundaries["-X"].append(idx)
+                if x == lx - 1: boundaries["+X"].append(idx)
+                if y == 0:      boundaries["-Y"].append(idx)
+                if y == ly - 1: boundaries["+Y"].append(idx)
+                if z == 0:      boundaries["-Z"].append(idx)
+                if z == lz - 1: boundaries["+Z"].append(idx)
+    return edges, boundaries
+
+def calc_xeb(ideal_probs: np.ndarray, width: int, compute_hog: bool = True) -> Tuple[float, Optional[float]]:
+    """
+    Calculates exact Porter-Thomas XEB and HOG from sampled probability distributions.
+    Expects ideal_probs to be queried from the exact subset of measured bitstrings.
+    """
+    n_pow = float(1 << width)
+    if ideal_probs.size == 0:
+        return 0.0, (0.0 if compute_hog else None)
+    xeb = n_pow * float(np.mean(ideal_probs)) - 1.0
+    if compute_hog:
+        hog = float(np.mean(ideal_probs > (math.log(2.0) / n_pow)))
+    else:
+        hog = None
+    return xeb, hog
+
+# =====================================================================
+# RCS LAYER: APPLY
+# =====================================================================
+def apply_rcs_layer(sim, num_qubits: int, edges: List[Tuple[int, int]],
+                    depth: int, rng: random.Random) -> None:
+    for _ in range(depth):
+        for q in range(num_qubits):
+            theta = rng.uniform(0.0, 2.0 * math.pi)
+            phi   = rng.uniform(0.0, 2.0 * math.pi)
+            lam   = rng.uniform(0.0, 2.0 * math.pi)
+            sim.u(q, theta, phi, lam)
+        shuffled = list(edges)
+        rng.shuffle(shuffled)
+        used: set = set()
+        for q1, q2 in shuffled:
+            if q1 not in used and q2 not in used:
+                sim.iswap(q1, q2)
+                used.add(q1); used.add(q2)
+
+# =====================================================================
+# WORKER PROCESS
+# =====================================================================
+def gpu_worker_process(
+    rank: int,
+    assigned_patches: List[int],
+    conn: mp.connection.Connection,
+    dt: float,
+    total_steps: int,
+    initial_hx: float,
+    target_J: float,
+    target_hx: float,
+    target_hz: float,
+    measure_every: int,
+    rcs_cfg: Dict[str, Any],
+) -> None:
+    import time as _t
+    stagger_time = rank * 10.0
+    if stagger_time > 0:
+        _t.sleep(stagger_time)
+    print(f"[Worker {rank}] Awakening after {stagger_time:.0f}s stagger...", file=sys.stderr, flush=True)
+
+    os.environ["PYQRACK_SHARED_LIB_PATH"] = "/usr/local/lib/qrack/libqrack_pinvoke.so"
+    os.environ["OCL_ICD_PLATFORM_SORT"]    = "none"
+
+    physical_gpu_index = rank // WORKERS_PER_GPU
+    os.environ["QRACK_OCL_DEFAULT_DEVICE"]           = str(physical_gpu_index)
+    os.environ["QRACK_QPAGER_DEVICES"]               = str(physical_gpu_index)
+    os.environ["QRACK_QUNITMULTI_DEVICES"]           = str(physical_gpu_index)
+    os.environ["QRACK_MAX_ALLOC_MB"]                 = str(8000 // WORKERS_PER_GPU)
+    os.environ["QRACK_DISABLE_QUNIT_FIDELITY_GUARD"] = "1"
+
+    from pyqrack import QrackSimulator
+
+    sims: Dict[int, Any] = {}
+
+    try:
+        # --- U GATE SMOKE TEST ---
+        _sim_u = QrackSimulator(qubit_count=1, is_binary_decision_tree=False)
+        try:
+            _sim_u.u(0, 0.1, 0.2, 0.3)
+        except Exception as e:
+            raise RuntimeError(f"Fatal: sim.u() gate not available in this PyQrack version: {e}")
+        del _sim_u
+
+        # --- PAULI CODE AUTODETECT ---
+        _THRESH = 0.5
+        _probe_z = QrackSimulator(qubit_count=1, is_binary_decision_tree=False)
+        vals0_z = {}
+        for _code in range(8):
+            try: vals0_z[_code] = _probe_z.pauli_expectation([0], [_code])
+            except Exception: pass
+        _probe_z.x(0)
+        PZ, SIGN_Z = None, None
+        for _code, v0 in vals0_z.items():
+            try: v1 = _probe_z.pauli_expectation([0], [_code])
+            except Exception: continue
+            if abs(v0) > _THRESH and abs(v1) > _THRESH and (v0 * v1) < 0:
+                PZ = _code; SIGN_Z = 1.0 if v0 > 0 else -1.0; break
+        if PZ is None: raise RuntimeError("Fatal: could not autodetect PZ code")
+        del _probe_z
+
+        _probe_x = QrackSimulator(qubit_count=1, is_binary_decision_tree=False)
+        _probe_x.h(0)
+        vals0_x = {}
+        for _code in range(8):
+            if _code == PZ: continue
+            try: vals0_x[_code] = _probe_x.pauli_expectation([0], [_code])
+            except Exception: pass
+        _probe_x.z(0)
+        PX, SIGN_X = None, None
+        for _code, v0 in vals0_x.items():
+            try: v1 = _probe_x.pauli_expectation([0], [_code])
+            except Exception: continue
+            if abs(v0) > _THRESH and abs(v1) > _THRESH and (v0 * v1) < 0:
+                PX = _code; SIGN_X = 1.0 if v0 > 0 else -1.0; break
+        if PX is None: raise RuntimeError("Fatal: could not autodetect PX code")
+        del _probe_x
+
+        _probe_y = QrackSimulator(qubit_count=1, is_binary_decision_tree=False)
+        _c, _s = math.cos(math.pi / 4.0), math.sin(math.pi / 4.0)
+        _probe_y.mtrx([complex(_c,0), complex(0,_s), complex(0,_s), complex(_c,0)], 0)
+        vals0_y = {}
+        for _code in range(8):
+            if _code in (PX, PZ): continue
+            try: vals0_y[_code] = _probe_y.pauli_expectation([0], [_code])
+            except Exception: pass
+        _probe_y.z(0)
+        PY, SIGN_Y = None, None
+        for _code, v0 in vals0_y.items():
+            try: v1 = _probe_y.pauli_expectation([0], [_code])
+            except Exception: continue
+            if abs(v0) > _THRESH and abs(v1) > _THRESH and (v0 * v1) < 0:
+                PY = _code; SIGN_Y = 1.0 if v0 > 0 else -1.0; break
+        if PY is None: raise RuntimeError("Fatal: could not autodetect PY code")
+        del _probe_y
+
+        # --- ANGLE CONVENTION AUTODETECT ---
+        _sim_mag = QrackSimulator(qubit_count=1, is_binary_decision_tree=False)
+        _sim_mag.r(PX, math.pi, 0)
+        _corrected = SIGN_Z * _sim_mag.pauli_expectation([0], [PZ])
+        if   abs(_corrected + 1.0) < 0.1: ANGLE_SCALE = 1.0
+        elif abs(_corrected - 1.0) < 0.1: ANGLE_SCALE = 0.5
+        else: raise RuntimeError(
+            f"Fatal: ambiguous ANGLE_SCALE, SIGN_Z*<Z>={_corrected:.6f}")
+        del _sim_mag
+
+        # --- VECTORIZED r() DETECTION ---
+        _vec_probe = QrackSimulator(qubit_count=2,
+                                    is_binary_decision_tree=False,
+                                    is_gpu=True)
+        _VECTORIZED_R = False
+        try:
+            _vec_probe.r(PX, 0.0, [0, 1])
+            _VECTORIZED_R = True
+        except Exception:
+            pass
+        del _vec_probe
+        print(f"[Worker {rank}] Vectorized r(): {'YES' if _VECTORIZED_R else 'NO (fallback to loop)'}", file=sys.stderr, flush=True)
+              
+        # --- MEASURE_SHOTS LSB/MSB API SMOKE TEST ---
+        _sim_ms = QrackSimulator(qubit_count=5, is_binary_decision_tree=False, is_gpu=True)
+        _sim_ms.x(0)
+        _sim_ms.x(2)  # Prepare |00101> -> Index 5 in LSB
+        _probs_ms = np.array(_sim_ms.out_probs())
+        _shot_ms = _sim_ms.measure_shots(list(range(5)), 1)[0]
+        if _probs_ms[int(_shot_ms)] < 0.9:
+            raise RuntimeError(f"Fatal: measure_shots LSB/MSB indexing mismatch detected. "
+                               f"Prepared |5>, measure_shots returned {_shot_ms}, mapping to prob {_probs_ms[int(_shot_ms)]:.4f}.")
+        del _sim_ms
+
+        # --- PROB_PERM LSB/MSB API SMOKE TEST ---
+        # Note: Allocates a minimal GPU context to verify the exact hardware dispatch path.
+        _sim_pp = QrackSimulator(qubit_count=3, is_binary_decision_tree=False, is_gpu=True)
+        _sim_pp.x(0)  # Prepare |001> -> Index 1 in LSB
+        if abs(float(_sim_pp.prob_perm([0, 1, 2], [1, 0, 0])) - 1.0) > 0.01:
+            raise RuntimeError("Fatal: prob_perm LSB/MSB indexing mismatch detected.")
+        del _sim_pp
+
+        # --- GATE HELPERS ---
+        _all_q_list = list(range(QUBITS_PER_PATCH))
+
+        if _VECTORIZED_R:
+            def apply_rx_all(sim, theta):
+                sim.r(PX, float(theta) * ANGLE_SCALE, _all_q_list)
+            def apply_rz_all(sim, theta):
+                sim.r(PZ, float(theta) * ANGLE_SCALE, _all_q_list)
+        else:
+            def apply_rx_all(sim, theta):
+                ang = float(theta) * ANGLE_SCALE
+                for q in _all_q_list: sim.r(PX, ang, q)
+            def apply_rz_all(sim, theta):
+                ang = float(theta) * ANGLE_SCALE
+                for q in _all_q_list: sim.r(PZ, ang, q)
+
+        def apply_rx(sim, theta, q): sim.r(PX, float(theta) * ANGLE_SCALE, q)
+        def apply_ry(sim, theta, q): sim.r(PY, float(theta) * ANGLE_SCALE, q)
+        def apply_rz(sim, theta, q): sim.r(PZ, float(theta) * ANGLE_SCALE, q)
+
+        def apply_zz(sim, theta, q1, q2):
+            sim.mcx([q1], q2)
+            apply_rz(sim, 2.0 * theta, q2)
+            sim.mcx([q1], q2)
+
+        def trotter_step_body(sim, num_qubits, edge_list, J, hx, hz, dt_local):
+            dt_half      = dt_local / 2.0
+            theta_x      = -2.0 * hx * dt_half
+            theta_z_half = -2.0 * hz * dt_half
+            theta_zz     = -J * dt_local
+            apply_rx_all(sim, theta_x)
+            apply_rz_all(sim, theta_z_half)
+            for q1, q2 in edge_list: apply_zz(sim, theta_zz, q1, q2)
+            apply_rz_all(sim, theta_z_half)
+            apply_rx_all(sim, theta_x)
+
+        def z_means(sim, qubits):
+            return np.array([SIGN_Z * float(sim.pauli_expectation([q], [PZ])) for q in qubits])
+        def x_means(sim, qubits):
+            return np.array([SIGN_X * float(sim.pauli_expectation([q], [PX])) for q in qubits])
+        def y_means(sim, qubits):
+            return np.array([SIGN_Y * float(sim.pauli_expectation([q], [PY])) for q in qubits])
+        def zz_means_mf(z_exp, edges):
+            return np.array([z_exp[q1] * z_exp[q2] for q1, q2 in edges])
+
+        def apply_kicks(sim, kicks, time_delta):
+            if not kicks: return
+            coef = -2.0 * time_delta
+            for raw_q, (kx, ky, kz) in kicks.items():
+                q = int(raw_q)
+                if abs(kx * coef) > 1e-12: apply_rx(sim, kx * coef, q)
+                if abs(ky * coef) > 1e-12: apply_ry(sim, ky * coef, q)
+                if abs(kz * coef) > 1e-12: apply_rz(sim, kz * coef, q)
+
+        # --- TOPOLOGY ---
+        intra_edges, boundaries = generate_27q_lattice_subvolume()
+        all_q = list(range(QUBITS_PER_PATCH))
+
+        rcs_enabled       = rcs_cfg.get("enabled", False)
+        probes_per_worker = max(1, min(int(rcs_cfg.get("probes_per_worker", 1)),
+                                       len(assigned_patches)))
+        probe_rotate      = rcs_cfg.get("probe_rotate", True)
+        rcs_round         = 0   # advances on routine cadence beats only
+
+        full_snapshot_steps = set(rcs_cfg.get("full_snapshot_steps", []))
+        master_seed       = rcs_cfg.get("master_seed", 1337)
+        _warned_fidelity  = False
+
+        # --- SIMULATOR ALLOCATION ---
+        for patch_id in assigned_patches:
+            sim = QrackSimulator(
+                qubit_count=QUBITS_PER_PATCH,
+                is_binary_decision_tree=False,
+                is_stabilizer_hybrid=False,
+                is_gpu=True,
+            )
+            for q in range(QUBITS_PER_PATCH): sim.h(q)
+            sims[patch_id] = sim
+            try:
+                _ = sim.pauli_expectation([0], [PZ])
+            except Exception as e:
+                raise RuntimeError(f"Fatal: VRAM smoke test failed on patch {patch_id}: {e}")
+
+        print(f"[Worker {rank}] {len(assigned_patches)} patches allocated.", file=sys.stderr, flush=True)
+
+        kick_payloads = {patch_id: {} for patch_id in assigned_patches}
+        meas_count    = 0
+        time_delta    = dt * measure_every
+
+        for t in range(total_steps):
+            s          = t / max(1, total_steps - 1)
+            current_hx = (1.0 - s) * initial_hx + s * rcs_cfg["target_hx"]
+            current_J  = s * target_J
+            current_hz = s * rcs_cfg["target_hz"]
+            is_measure = (t % measure_every == 0) or (t == total_steps - 1)
+
+            is_snapshot  = (t in full_snapshot_steps)
+            routine_beat = (meas_count % max(1, rcs_cfg["validate_every"]) == 0)
+            do_rcs       = rcs_enabled and is_measure and (is_snapshot or routine_beat)
+
+            if is_snapshot:
+                rcs_probe_this_step = set(assigned_patches)
+            elif do_rcs:
+                n_local = len(assigned_patches)
+                if probe_rotate:
+                    base = (rcs_round * probes_per_worker) % n_local
+                    rcs_probe_this_step = {
+                        assigned_patches[(base + j) % n_local]
+                        for j in range(probes_per_worker)
+                    }
+                else:
+                    rcs_probe_this_step = set(assigned_patches[:probes_per_worker])
+            else:
+                rcs_probe_this_step = set()
+
+            patch_data = {}
+
+            for patch_id in assigned_patches:
+                sim = sims[patch_id]
+
+                if is_measure and kick_payloads[patch_id]:
+                    apply_kicks(sim, kick_payloads[patch_id], time_delta)
+
+                t0_tr = time.perf_counter()
+                trotter_step_body(sim, QUBITS_PER_PATCH, intra_edges,
+                                  current_J, current_hx, current_hz, dt)
+                lat_trotter = (time.perf_counter() - t0_tr) * 1000.0
+
+                if not is_measure:
+                    continue
+
+                t0_tomo = time.perf_counter()
+                
+                x_exp = x_means(sim, all_q)
+                y_exp = y_means(sim, all_q)
+                z_exp = z_means(sim, all_q)
+                
+                state = {
+                    "X": x_exp,
+                    "Y": y_exp,
+                    "Z": z_exp,
+                    "var_X": np.clip(1.0 - x_exp**2, 0.0, 1.0),
+                    "var_Y": np.clip(1.0 - y_exp**2, 0.0, 1.0),
+                    "var_Z": np.clip(1.0 - z_exp**2, 0.0, 1.0),
+                }
+                
+                zz_exp = zz_means_mf(state["Z"], intra_edges)
+                bulk_e = (
+                    -current_hz * float(np.sum(state["Z"]))
+                    - current_J  * float(np.sum(zz_exp))
+                    - current_hx * float(np.sum(state["X"]))
+                )
+                lat_tomo = (time.perf_counter() - t0_tomo) * 1000.0
+
+                try:
+                    fidelity = float(sim.get_unitary_fidelity())
+                except AttributeError:
+                    fidelity = 1.0
+                    if not _warned_fidelity:
+                        print(f"[Worker {rank}] Warning: get_unitary_fidelity() unavailable.", file=sys.stderr, flush=True)
+                        _warned_fidelity = True
+
+                # --- RCS VALIDATION (Ket Snapshot Restoration) ---
+                rcs_xeb, rcs_hog = None, None
+                lat_rcs = 0.0
+
+                if do_rcs and patch_id in rcs_probe_this_step:
+                    t0_rcs = time.perf_counter()
+                    pristine_ket = None
+                    try:
+                        depth = rcs_cfg["depth"]
+                        shots = rcs_cfg["shots"]
+                        
+                        # Decorrelate the circuit sampling RNG
+                        rng_circuit = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
+
+                        # Snapshot #1: The intact Trotter state
+                        pristine_ket = sim.out_ket()
+                        apply_rcs_layer(sim, QUBITS_PER_PATCH, intra_edges, depth, rng_circuit)
+
+                        # Snapshot #2: The intact RCS superposition
+                        rcs_ket = sim.out_ket()
+                        
+                        try:
+                            # TRUE PORTER-THOMAS XEB:
+                            # measure_shots is destructive, collapsing the wavefunction. We must query
+                            # prob_perm() against the full superposition, so we restore immediately.
+                            samples = sim.measure_shots(all_q, shots)
+                            
+                            # Restore the superposition so the probabilities are mathematically correct
+                            sim.in_ket(rcs_ket)
+                        finally:
+                            del rcs_ket
+                        
+                        ideal_p = np.array([
+                            float(sim.prob_perm(all_q, [(int(bs) >> i) & 1 for i in range(QUBITS_PER_PATCH)]))
+                            for bs in samples
+                        ], dtype=np.float64)
+                        
+                        # HOG is disabled as the threshold saturates at large n (27 qubits) and converges to ~0.5
+                        rcs_xeb, rcs_hog = calc_xeb(ideal_p, QUBITS_PER_PATCH, compute_hog=False)
+                        lat_rcs = (time.perf_counter() - t0_rcs) * 1000.0
+                        
+                        if is_snapshot:
+                            print(f"[Worker {rank}] Snapshot RCS patch {patch_id} step {t}: "
+                                  f"XEB={rcs_xeb:+.4f}", file=sys.stderr, flush=True)
+
+                    except Exception as e:
+                        print(f"[Worker {rank}] RCS error patch {patch_id} step {t}: {e}", file=sys.stderr, flush=True)
+                        rcs_xeb, rcs_hog = None, None
+                        
+                    finally:
+                        if pristine_ket is not None:
+                            try:
+                                sim.in_ket(pristine_ket)
+                            except Exception as restore_e:
+                                print(f"[Worker {rank}] FATAL: Failed to restore ket on patch {patch_id}: {restore_e}", 
+                                      file=sys.stderr, flush=True)
+                                raise  # Propagate failure to prevent poisoning subsequent Trotter steps
+                            finally:
+                                del pristine_ket
+
+                patch_data[patch_id] = {
+                    "state":                  state,
+                    "meanfield_bulk_energy":  bulk_e,
+                    "lat_trotter_ms":         lat_trotter,
+                    "lat_tomo_ms":            lat_tomo,
+                    "lat_rcs_ms":             lat_rcs,
+                    "unitary_fidelity":       fidelity,
+                    "rcs_xeb":                rcs_xeb,
+                    "rcs_hog":                rcs_hog,
+                    "is_snapshot":            is_snapshot,
+                }
+
+            if is_measure:
+                meas_count += 1
+                if routine_beat:
+                    rcs_round += 1
+                conn.send(patch_data)
+                kick_payloads = conn.recv()
+
+    finally:
+        for patch_id in list(sims.keys()):
+            _sim_obj = sims.pop(patch_id); del _sim_obj
+        sims.clear()
+        gc.collect()
+        conn.close()
+
+
+# =====================================================================
+# MASTER ORCHESTRATOR
+# =====================================================================
+class MultiGpuHadronEngine:
+    def __init__(self, master_seed: int = 1337) -> None:
+        self.master_seed = master_seed
+        self.intra_edges, self.boundaries = generate_27q_lattice_subvolume()
+        self.all_boundary_qubits = sorted(
+            set(q for face in self.boundaries.values() for q in face)
+        )
+        self._bq_to_idx = {q: i for i, q in enumerate(self.all_boundary_qubits)}
+        self._bq_arr    = np.array(self.all_boundary_qubits, dtype=np.intp)
+        
+        face_sizes = {k: len(v) for k, v in self.boundaries.items()}
+        if len(set(face_sizes.values())) != 1 or 0 in face_sizes.values():
+            raise ValueError(f"Asymmetric or empty boundary faces detected: {face_sizes}.")
+
+        self.patch_coords: Dict[int, Tuple[int, int, int]] = {}
+        idx = 0
+        for x in range(GRID_X):
+            for y in range(GRID_Y):
+                for z in range(GRID_Z):
+                    self.patch_coords[idx] = (x, y, z)
+                    idx += 1
+        self.coord_to_patch = {v: k for k, v in self.patch_coords.items()}
+        self.lattice_history: List[np.ndarray] = []
+        
+        # Incorporate os.getpid() and a hyphen to eliminate parallel multi-instance collisions
+        self.timestamp = f"{int(time.time())}-{os.getpid()}"
+        self.config_file = f"lattice_config_{self.timestamp}.json"
+        
+        self.state_file_prefix = f"macroscopic_lattice_states_multi_{self.timestamp}_part"
+        self.state_file_suffix = ".npy"
+        self._state_chunk_counter = 0
+        
+        self._init_files()
+
+        self.worker_assignments: List[List[int]] = [[] for _ in range(TOTAL_WORKERS)]
+        for i in range(TOTAL_PATCHES):
+            self.worker_assignments[i % TOTAL_WORKERS].append(i)
+
+    def _get_state_filepath(self, chunk_idx: int) -> str:
+        return f"{self.state_file_prefix}{chunk_idx:0{STATE_CHUNK_DIGITS}d}{self.state_file_suffix}"
+
+    def _init_files(self) -> None:
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump({
+                    "grid_x": GRID_X, "grid_y": GRID_Y, "grid_z": GRID_Z,
+                    "num_patches": TOTAL_PATCHES,
+                    "qubits_per_patch": QUBITS_PER_PATCH,
+                    "rcs_depth": RCS_DEPTH,
+                    "rcs_shots": RCS_SHOTS,
+                    "rcs_validate_every": RCS_VALIDATE_EVERY,
+                    "rcs_probes_per_worker": RCS_PROBES_PER_WORKER,
+                    "rcs_probe_rotate": RCS_PROBE_ROTATE,
+                    "rcs_full_snapshot_steps": RCS_FULL_SNAPSHOT_STEPS,
+                    "csv_chunk_size": CSV_CHUNK_SIZE,
+                    "csv_chunk_digits": CSV_CHUNK_DIGITS,
+                    "state_chunk_size": STATE_CHUNK_SIZE,
+                    "state_chunk_digits": STATE_CHUNK_DIGITS,
+                    "run_id": self.timestamp,  # Format: "{unix_epoch}-{pid}" for collision safety
+                    "state_file_prefix": self.state_file_prefix,
+                    "state_file_suffix": self.state_file_suffix,
+                }, f)
+        except Exception as e:
+            print(f"[Config] Warning: init failed: {e}", file=sys.stderr, flush=True)
+
+    def _log_energy(self, step: int, anneal: float, bulk: float, bound: float, total: float, min_fid: float) -> None:
+        # CSV chunk index is step-derived (not a monotonic counter) so readers can locate
+        # data for a given step range without scanning all files.
+        chunk_idx = step // CSV_CHUNK_SIZE
+        filepath = f"meanfield_energy_curve_multi_{self.timestamp}_part{chunk_idx:0{CSV_CHUNK_DIGITS}d}.csv"
+        try:
+            with open(filepath, 'a', newline='') as f:
+                # f.tell() == 0 in append mode reliably returns True only for empty/new files on local POSIX filesystems
+                is_new = f.tell() == 0
+                w = csv.DictWriter(f, fieldnames=[
+                    "Step", "Anneal_Percent", "MeanField_Bulk_Energy",
+                    "MeanField_Boundary_Energy", "MeanField_Total_Energy",
+                    "Min_Unitary_Fidelity",
+                ])
+                if is_new: w.writeheader()
+                w.writerow({
+                    "Step": step, "Anneal_Percent": anneal,
+                    "MeanField_Bulk_Energy": bulk,
+                    "MeanField_Boundary_Energy": bound,
+                    "MeanField_Total_Energy": total,
+                    "Min_Unitary_Fidelity": min_fid,
+                })
+        except Exception as e:
+            print(f"[CSV] Energy log error on chunk {chunk_idx}: {e}", file=sys.stderr, flush=True)
+
+    def _log_profiles(self, step: int, patch_profiles: dict) -> None:
+        # CSV chunk index is step-derived (not a monotonic counter) so readers can locate
+        # data for a given step range without scanning all files.
+        chunk_idx = step // CSV_CHUNK_SIZE
+        filepath = f"boundary_profiles_multi_{self.timestamp}_part{chunk_idx:0{CSV_CHUNK_DIGITS}d}.csv"
+        try:
+            with open(filepath, 'a', newline='') as f:
+                # f.tell() == 0 in append mode reliably returns True only for empty/new files on local POSIX filesystems
+                is_new = f.tell() == 0
+                w = csv.DictWriter(f, fieldnames=["Step", "Patch", "Face", "X_mean", "Y_mean", "Z_mean"])
+                if is_new: w.writeheader()
+                for patch_id, prof in patch_profiles.items():
+                    for face_name, face_qubits in self.boundaries.items():
+                        if not face_qubits: continue
+                        xm = float(np.mean([prof["means"]["X"][self._bq_to_idx[q]] for q in face_qubits]))
+                        ym = float(np.mean([prof["means"]["Y"][self._bq_to_idx[q]] for q in face_qubits]))
+                        zm = float(np.mean([prof["means"]["Z"][self._bq_to_idx[q]] for q in face_qubits]))
+                        w.writerow({"Step": step, "Patch": patch_id, "Face": face_name, "X_mean": xm, "Y_mean": ym, "Z_mean": zm})
+        except Exception as e:
+            print(f"[CSV] Profile log error on chunk {chunk_idx}: {e}", file=sys.stderr, flush=True)
+
+    def _log_rcs(self, step: int, anneal: float, rcs_records: List[Tuple[int, float, float, bool]]) -> None:
+        if not rcs_records: return
+        # CSV chunk index is step-derived (not a monotonic counter) so readers can locate
+        # data for a given step range without scanning all files.
+        chunk_idx = step // CSV_CHUNK_SIZE
+        filepath = f"rcs_validation_multi_{self.timestamp}_part{chunk_idx:0{CSV_CHUNK_DIGITS}d}.csv"
+        try:
+            with open(filepath, 'a', newline='') as f:
+                # f.tell() == 0 in append mode reliably returns True only for empty/new files on local POSIX filesystems
+                is_new = f.tell() == 0
+                w = csv.DictWriter(f, fieldnames=[
+                    "Step", "Anneal_Percent", "Patch", "RCS_Depth", "XEB_RCS", "HOG_RCS", "Is_Snapshot"
+                ])
+                if is_new: w.writeheader()
+                for patch_id, xeb, hog, is_snap in rcs_records:
+                    w.writerow({
+                        "Step": step, "Anneal_Percent": anneal, "Patch": patch_id,
+                        "RCS_Depth": RCS_DEPTH, "XEB_RCS": xeb, "HOG_RCS": "" if hog is None else hog,
+                        "Is_Snapshot": int(is_snap)
+                    })
+        except Exception as e:
+            print(f"[CSV] RCS log error on chunk {chunk_idx}: {e}", file=sys.stderr, flush=True)
+
+    def run(self, total_steps: int, dt: float, initial_hx: float,
+            target_g_face: float, target_J: float,
+            target_hx: float, target_hz: float,
+            measure_every: int = 1,
+            effective_shots: float = 512.0) -> None:
+
+        if total_steps < 1:   raise ValueError("total_steps must be >= 1")
+        if measure_every < 1: raise ValueError("measure_every must be >= 1")
+
+        if not all(s % measure_every == 0 for s in RCS_FULL_SNAPSHOT_STEPS):
+            raise ValueError(f"All RCS_FULL_SNAPSHOT_STEPS must be multiples of measure_every ({measure_every})")
+            
+        invalid_snaps = [s for s in RCS_FULL_SNAPSHOT_STEPS if s >= total_steps]
+        if invalid_snaps:
+            raise ValueError(
+                f"RCS_FULL_SNAPSHOT_STEPS contains steps beyond total_steps={total_steps}: {invalid_snaps}"
+            )
+
+        rcs_cfg = {
+            "enabled":              RCS_VALIDATION_ENABLED,
+            "depth":                RCS_DEPTH,
+            "shots":                RCS_SHOTS,
+            "validate_every":       RCS_VALIDATE_EVERY,
+            "probes_per_worker":    RCS_PROBES_PER_WORKER,
+            "probe_rotate":         RCS_PROBE_ROTATE,
+            "full_snapshot_steps":  RCS_FULL_SNAPSHOT_STEPS,
+            "target_hx":            target_hx,
+            "target_hz":            target_hz,
+            "master_seed":          self.master_seed,
+        }
+
+        print(f"[Engine] {TOTAL_PATCHES} patches, {TOTAL_PATCHES * QUBITS_PER_PATCH} qubits, "
+              f"{GPUS_AVAILABLE} GPUs, {total_steps} steps", file=sys.stderr, flush=True)
+        print(f"[Master] Staggered init - expect ~{TOTAL_WORKERS * 10}s before first output.", file=sys.stderr, flush=True)
+        
+        if RCS_VALIDATION_ENABLED:
+            n_probe = RCS_PROBES_PER_WORKER * TOTAL_WORKERS
+            print(f"[Engine] RCS ON: depth={RCS_DEPTH}, shots={RCS_SHOTS}, "
+                  f"{RCS_PROBES_PER_WORKER} probe(s)/GPU x {TOTAL_WORKERS} GPUs "
+                  f"= {n_probe} patches/round, rotation "
+                  f"{'ON' if RCS_PROBE_ROTATE else 'OFF'}, "
+                  f"every {RCS_VALIDATE_EVERY} measure steps", file=sys.stderr, flush=True)
+            print(f"[Engine] Full-cube snapshots at steps: {RCS_FULL_SNAPSHOT_STEPS}", file=sys.stderr, flush=True)
+
+        active_ranks = [r for r in range(TOTAL_WORKERS) if self.worker_assignments[r]]
+        workers, pipes = [], []
+
+        for rank in active_ranks:
+            parent_conn, child_conn = mp.Pipe()
+            proc = mp.Process(
+                target=gpu_worker_process,
+                args=(rank, self.worker_assignments[rank], child_conn,
+                      dt, total_steps, initial_hx, target_J,
+                      target_hx, target_hz, measure_every, rcs_cfg),
+            )
+            proc.start()
+            child_conn.close()
+            workers.append(proc)
+            pipes.append(parent_conn)
+
+        try:
+            for t in range(total_steps):
+                s              = t / max(1, total_steps - 1)
+                current_g_face = s * target_g_face
+                is_measure     = (t % measure_every == 0) or (t == total_steps - 1)
+                
+                # Snapshot evaluation decoupled from RCS results for correct telemetry tagging
+                is_snapshot_step = (t in RCS_FULL_SNAPSHOT_STEPS)
+                
+                if not is_measure:
+                    continue
+
+                # wall-clock includes IPC blocking time (= max worker step latency + master overhead)
+                t0 = time.perf_counter()
+
+                patch_full_states: Dict[int, dict] = {}
+                bulk_energy      = 0.0
+                max_lat_trotter  = max_lat_tomo = max_lat_rcs = 0.0
+                min_fidelity     = 1.0
+                rcs_records: List[Tuple[int, float, float, bool]] = []
+
+                for conn in pipes:
+                    # 300-second watchdog to accommodate rusticl JIT compilation overhead on massive snapshot steps
+                    if not conn.poll(timeout=300.0):
+                        raise RuntimeError("Worker IPC timeout: GPU deadlock or process hang detected.")
+                    try:
+                        data = conn.recv()
+                    except EOFError:
+                        raise RuntimeError("Worker IPC connection lost.")
+                    for patch_id, payload in data.items():
+                        patch_full_states[patch_id] = payload["state"]
+                        bulk_energy    += payload["meanfield_bulk_energy"]
+                        max_lat_trotter = max(max_lat_trotter, payload["lat_trotter_ms"])
+                        max_lat_tomo    = max(max_lat_tomo, payload["lat_tomo_ms"])
+                        max_lat_rcs     = max(max_lat_rcs, payload.get("lat_rcs_ms", 0.0))
+                        min_fidelity    = min(min_fidelity, payload.get("unitary_fidelity", 1.0))
+                        
+                        if payload.get("rcs_xeb") is not None:
+                            is_snap = bool(payload.get("is_snapshot", False))
+                            rcs_records.append((
+                                patch_id, payload["rcs_xeb"], payload["rcs_hog"], is_snap
+                            ))
+
+                if len(patch_full_states) != TOTAL_PATCHES:
+                    raise RuntimeError(f"IPC gather incomplete: got {len(patch_full_states)}/{TOTAL_PATCHES}")
+
+                step_state    = np.zeros((TOTAL_PATCHES, QUBITS_PER_PATCH, 3))
+                patch_profiles: Dict[int, dict] = {}
+                bq = self._bq_arr
+
+                for patch_id, state in patch_full_states.items():
+                    step_state[patch_id, :, 0] = state["X"]
+                    step_state[patch_id, :, 1] = state["Y"]
+                    step_state[patch_id, :, 2] = state["Z"]
+                    patch_profiles[patch_id] = {
+                        "means": { "X": state["X"][bq], "Y": state["Y"][bq], "Z": state["Z"][bq] },
+                        "vars":  { "X": state["var_X"][bq], "Y": state["var_Y"][bq], "Z": state["var_Z"][bq] },
+                    }
+
+                self.lattice_history.append(step_state.copy())
+                if len(self.lattice_history) >= STATE_CHUNK_SIZE:
+                    try:
+                        filepath = self._get_state_filepath(self._state_chunk_counter)
+                        np.save(filepath, np.array(self.lattice_history))
+                    except Exception as e:
+                        print(f"[Checkpoint] State save failed at step {t}, {len(self.lattice_history)} frames lost: {e}", file=sys.stderr, flush=True)
+                    finally:
+                        self.lattice_history.clear()
+                        self._state_chunk_counter += 1
+
+                next_kick_payloads = {pid: {} for pid in range(TOTAL_PATCHES)}
+                macroscopic_boundary_energy = 0.0
+                scale = np.sqrt(dt / effective_shots)
+                n_b   = len(self.all_boundary_qubits)
+                stochastic_noise: Dict[int, dict] = {}
+
+                for patch_id in range(TOTAL_PATCHES):
+                    prof  = patch_profiles[patch_id]
+                    rng_p = np.random.default_rng([self.master_seed, t, patch_id])
+                    xn = rng_p.normal(0, 1, n_b) * np.sqrt(prof["vars"]["X"]) * scale
+                    yn = rng_p.normal(0, 1, n_b) * np.sqrt(prof["vars"]["Y"]) * scale
+                    zn = rng_p.normal(0, 1, n_b) * np.sqrt(prof["vars"]["Z"]) * scale
+                    stochastic_noise[patch_id] = {
+                        q: (xn[i], yn[i], zn[i]) for i, q in enumerate(self.all_boundary_qubits)
+                    }
+
+                for patch_id_1, (x1, y1, z1) in self.patch_coords.items():
+                    neighbors = {
+                        "+X": (x1+1, y1, z1), "-X": (x1-1, y1, z1),
+                        "+Y": (x1, y1+1, z1), "-Y": (x1, y1-1, z1),
+                        "+Z": (x1, y1, z1+1), "-Z": (x1, y1, z1-1),
+                    }
+                    for dir1, coord2 in neighbors.items():
+                        patch_id_2 = self.coord_to_patch.get(coord2)
+                        if patch_id_2 is None or patch_id_1 >= patch_id_2: continue
+                        dir2    = (dir1.replace("+", "temp").replace("-", "+").replace("temp", "-"))
+                        face1_q, face2_q = self.boundaries[dir1], self.boundaries[dir2]
+                        prof1, noise1 = patch_profiles[patch_id_1], stochastic_noise[patch_id_1]
+                        prof2, noise2 = patch_profiles[patch_id_2], stochastic_noise[patch_id_2]
+
+                        ax2 = np.mean([prof2["means"]["X"][self._bq_to_idx[q]] + noise2[q][0] for q in face2_q])
+                        ay2 = np.mean([prof2["means"]["Y"][self._bq_to_idx[q]] + noise2[q][1] for q in face2_q])
+                        az2 = np.mean([prof2["means"]["Z"][self._bq_to_idx[q]] + noise2[q][2] for q in face2_q])
+                        ax1 = np.mean([prof1["means"]["X"][self._bq_to_idx[q]] + noise1[q][0] for q in face1_q])
+                        ay1 = np.mean([prof1["means"]["Y"][self._bq_to_idx[q]] + noise1[q][1] for q in face1_q])
+                        az1 = np.mean([prof1["means"]["Z"][self._bq_to_idx[q]] + noise1[q][2] for q in face1_q])
+
+                        macroscopic_boundary_energy += (
+                            -current_g_face * (ax1*ax2 + ay1*ay2 + az1*az2) * ((len(face1_q) + len(face2_q)) / 2.0)
+                        )
+                        for q1f in face1_q:
+                            k = next_kick_payloads[patch_id_1].get(q1f, (0., 0., 0.))
+                            next_kick_payloads[patch_id_1][q1f] = (k[0] + current_g_face * ax2, k[1] + current_g_face * ay2, k[2] + current_g_face * az2)
+                        for q2f in face2_q:
+                            k = next_kick_payloads[patch_id_2].get(q2f, (0., 0., 0.))
+                            next_kick_payloads[patch_id_2][q2f] = (k[0] + current_g_face * ax1, k[1] + current_g_face * ay1, k[2] + current_g_face * az1)
+
+                total_energy = bulk_energy + macroscopic_boundary_energy
+
+                snap_tag = " [SNAP]" if is_snapshot_step else ""
+                if rcs_records:
+                    xeb_mean = np.mean([r[1] for r in rcs_records])
+                    hog_vals = [r[2] for r in rcs_records if r[2] is not None]
+                    hog_str = f" HOG:{np.mean(hog_vals):.3f}" if hog_vals else ""
+                    rcs_tag = f" XEB:{xeb_mean:+.3f}{hog_str}[{len(rcs_records)}p]"
+                else:
+                    rcs_tag = ""
+                    
+                print(f"[Master] Step {t:03d}{snap_tag} E:{total_energy:+.4f} "
+                      f"Lat:{max_lat_trotter:.0f}/{max_lat_tomo:.0f}/{max_lat_rcs:.0f}ms "
+                      f"Fid:{min_fidelity:.5f}{rcs_tag} ({time.perf_counter()-t0:.2f}s)",
+                      file=sys.stderr, flush=True)
+
+                self._log_energy(t, s * 100, bulk_energy, macroscopic_boundary_energy, total_energy, min_fidelity)
+                self._log_profiles(t, patch_profiles)
+                self._log_rcs(t, s * 100, rcs_records)
+
+                for i, w_rank in enumerate(active_ranks):
+                    pipes[i].send({
+                        pid: next_kick_payloads[pid]
+                        for pid in self.worker_assignments[w_rank]
+                    })
+
+        finally:
+            for conn in pipes:
+                try: conn.close()
+                except Exception: pass
+            if self.lattice_history:
+                try:
+                    filepath = self._get_state_filepath(self._state_chunk_counter)
+                    np.save(filepath, np.array(self.lattice_history))
+                except Exception as e:
+                    print(f"[Checkpoint] Final state save failed: {e}", file=sys.stderr, flush=True)
+                finally:
+                    self.lattice_history.clear()
+                    self._state_chunk_counter += 1
+            for proc in workers:
+                proc.join(timeout=15)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=3)
+                    if proc.is_alive():
+                        try: proc.kill()
+                        except Exception: pass
+
+if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
+    engine = MultiGpuHadronEngine(master_seed=1337)
+    try:
+        engine.run(
+            total_steps=100,
+            dt=0.04,
+            initial_hx=3.0,
+            target_g_face=0.15,
+            target_J=1.0,
+            target_hx=0.5,
+            target_hz=0.2,
+            measure_every=1,
+            effective_shots=512.0,
+        )
+    except KeyboardInterrupt:
+        pass
