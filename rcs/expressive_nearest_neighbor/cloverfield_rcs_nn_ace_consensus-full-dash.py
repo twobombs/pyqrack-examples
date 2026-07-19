@@ -615,7 +615,7 @@ def run_dashboard(mode="interactive"):
                 sp.set_linewidth(1.0 if not np.isnan(val) else 0.5)
         mean_xeb = float(np.nanmean(xeb_arr))
         cube_title_obj.set_text(
-            f"XEB Cube — step {best}  mean={mean_xeb:+.3f}")
+            f"XEB Cube -- step {best}  mean={mean_xeb:+.3f}")
 
     # ----------------------------------------------------------------
     # SCREENSHOT HANDLER
