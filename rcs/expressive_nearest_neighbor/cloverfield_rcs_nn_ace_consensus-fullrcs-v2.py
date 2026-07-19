@@ -1,29 +1,39 @@
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place RCS Layer with Exact Ket Restoration (Rev 117)
+# + In-Place RCS Layer with Exact Ket Restoration (Rev 120)
 #
-# REVISION 117 - DOUBLE-KET TRUE PORTER-THOMAS XEB & MEMORY LEAK PLUG
+# REVISION 120 - EDGE CASE VALIDATION & PHYSICS DOCS
+# - Added strict validation in run() to block t=0 from snapshot steps.
+# - Expanded kick application comments to explicitly document the
+#   one-measurement-window propagation delay (lag) inherent in the
+#   first-order splitting.
+# - Updated startup telemetry to note the nominal nature of the sweep period.
 #
 # ARCHITECTURE:
 # - RCS LAYER: In-place random circuit applied directly to Trotter state.
-#   State is perfectly preserved via out_ket() / in_ket() wrapping. 
-#   A secondary double-ket buffer (`rcs_ket`) is used to temporarily hold 
-#   the RCS superposition, allowing destructive measure_shots() to sample 
+#   State is perfectly preserved via out_ket() / in_ket() wrapping.
+#   A secondary double-ket buffer (`rcs_ket`) is used to temporarily hold
+#   the RCS superposition, allowing destructive measure_shots() to sample
 #   the true distribution before reverting for exact prob_perm() queries.
 #   Both kets are strictly managed with nested try/finally blocks to prevent
 #   multi-gigabyte host RAM leaks during simulator exceptions.
 #
-# - PROBE ROTATION: Routine RCS validation is distributed by the workers 
-#   themselves to guarantee 100% GPU utilization, rotating through the 
-#   entire lattice to ensure comprehensive XEB coverage over time.
+# - DIAGONAL-PLANE PROBE SWEEP: Routine RCS probes target the anti-diagonal
+#   planes x+y+z = k of the 3x3x3 macroscopic cube, sweeping k = 0..6 across
+#   successive routine rounds.
 #
-# - IPC DELEGATION: Worker computes exact mathematical variance for Pauli
-#   observables (1 - <P>^2) and sends discrete `var_X/Y/Z` arrays. Master
-#   polls with a 300-second watchdog to accommodate JIT compilation overhead.
+# - PLANE-AWARE WORKER ASSIGNMENT: Patch->GPU mapping is derived from
+#   the plane sweep order so that every plane of size <= 6 maps to distinct
+#   GPUs (collision-free parallel probing).
 #
-# - DATA STREAMING: Engine safely outputs arbitrarily long runs by rotating
-#   CSV data and macroscopic state arrays (.npy) into discrete chunked files.
+# - PLANE-COHERENT CIRCUITS: When enabled, all patches probed in the same
+#   round share an identical RCS circuit (seeded on step only) to isolate
+#   underlying Trotter-state differences rather than circuit-instance noise.
+#
+# - ROUND SYNCHRONIZATION: rcs_round advances identically in every worker
+#   (it is a pure function of the shared step schedule), so all workers agree
+#   on the active plane index without any additional IPC.
 
 import os
 import sys
@@ -53,9 +63,15 @@ RCS_VALIDATION_ENABLED  = True
 RCS_DEPTH               = 20
 RCS_SHOTS               = 256
 RCS_VALIDATE_EVERY      = 5        # normal cadence: probe every 5 measure steps
-RCS_PROBES_PER_WORKER   = 1        # probes per GPU per routine round (6 GPUs -> 6 patches)
-RCS_PROBE_ROTATE        = True     # rotate probe through each worker's patch set
+RCS_PROBES_PER_WORKER   = 1        # legacy rotation mode only (unused in diag sweep)
+RCS_PROBE_ROTATE        = True     # legacy rotation mode only (unused in diag sweep)
 RCS_FULL_SNAPSHOT_STEPS = [42, 82, 99] # all-patch RCS: phase transition + final
+
+# --- DIAGONAL SWEEP CONFIGURATION ---
+RCS_DIAG_SWEEP          = True     # sweep anti-diagonal planes instead of per-worker rotation
+RCS_DIAG_PLANES         = [0, 1, 2, 3, 4, 5, 6]  # x+y+z=k planes, probed in this order
+                                   # use [2, 4] for pure 6-GPU-saturating planes only
+RCS_PLANE_COHERENT      = True     # identical RCS circuit across all patches in a round
 
 # --- LOGGING CONFIGURATION ---
 CSV_CHUNK_SIZE          = 50       # Rotate to a new CSV file every 50 steps
@@ -245,7 +261,7 @@ def gpu_worker_process(
             pass
         del _vec_probe
         print(f"[Worker {rank}] Vectorized r(): {'YES' if _VECTORIZED_R else 'NO (fallback to loop)'}", file=sys.stderr, flush=True)
-              
+
         # --- MEASURE_SHOTS LSB/MSB API SMOKE TEST ---
         _sim_ms = QrackSimulator(qubit_count=5, is_binary_decision_tree=False, is_gpu=True)
         _sim_ms.x(0)
@@ -329,6 +345,14 @@ def gpu_worker_process(
         probe_rotate      = rcs_cfg.get("probe_rotate", True)
         rcs_round         = 0   # advances on routine cadence beats only
 
+        # Diagonal-plane sweep: master ships the plane schedule; every worker
+        # derives the active plane from rcs_round, which is a pure function of
+        # the shared step schedule -> all workers agree without extra IPC.
+        probe_planes      = [list(p) for p in rcs_cfg.get("probe_planes", [])]
+        diag_mode         = len(probe_planes) > 0
+        plane_coherent    = bool(rcs_cfg.get("plane_coherent", False))
+        local_patch_set   = set(assigned_patches)
+
         full_snapshot_steps = set(rcs_cfg.get("full_snapshot_steps", []))
         master_seed       = rcs_cfg.get("master_seed", 1337)
         _warned_fidelity  = False
@@ -352,6 +376,13 @@ def gpu_worker_process(
 
         kick_payloads = {patch_id: {} for patch_id in assigned_patches}
         meas_count    = 0
+        
+        # Note on time_delta and kick application: The kicks represent inter-patch 
+        # mean-field coupling computed at the *previous* measurement step. Applying 
+        # them here introduces a one-measurement-window delay (lag). For measure_every > 1, 
+        # this delay scales with dt * measure_every, and applying the accumulated kick
+        # as a single large rotation becomes a coarse Trotter approximation. 
+        # At default measure_every=1, this is a standard first-order splitting lag.
         time_delta    = dt * measure_every
 
         for t in range(total_steps):
@@ -362,21 +393,27 @@ def gpu_worker_process(
             is_measure = (t % measure_every == 0) or (t == total_steps - 1)
 
             is_snapshot  = (t in full_snapshot_steps)
-            routine_beat = (meas_count % max(1, rcs_cfg["validate_every"]) == 0)
+            
+            # Ensure we don't probe the initial unevolved |+>^27 state at t=0
+            routine_beat = (meas_count > 0) and (meas_count % max(1, rcs_cfg["validate_every"]) == 0)
             do_rcs       = rcs_enabled and is_measure and (is_snapshot or routine_beat)
 
             if is_snapshot:
                 rcs_probe_this_step = set(assigned_patches)
             elif do_rcs:
-                n_local = len(assigned_patches)
-                if probe_rotate:
-                    base = (rcs_round * probes_per_worker) % n_local
-                    rcs_probe_this_step = {
-                        assigned_patches[(base + j) % n_local]
-                        for j in range(probes_per_worker)
-                    }
+                if diag_mode:
+                    plane = probe_planes[rcs_round % len(probe_planes)]
+                    rcs_probe_this_step = set(plane) & local_patch_set
                 else:
-                    rcs_probe_this_step = set(assigned_patches[:probes_per_worker])
+                    n_local = len(assigned_patches)
+                    if probe_rotate:
+                        base = (rcs_round * probes_per_worker) % n_local
+                        rcs_probe_this_step = {
+                            assigned_patches[(base + j) % n_local]
+                            for j in range(probes_per_worker)
+                        }
+                    else:
+                        rcs_probe_this_step = set(assigned_patches[:probes_per_worker])
             else:
                 rcs_probe_this_step = set()
 
@@ -397,11 +434,11 @@ def gpu_worker_process(
                     continue
 
                 t0_tomo = time.perf_counter()
-                
+
                 x_exp = x_means(sim, all_q)
                 y_exp = y_means(sim, all_q)
                 z_exp = z_means(sim, all_q)
-                
+
                 state = {
                     "X": x_exp,
                     "Y": y_exp,
@@ -410,7 +447,7 @@ def gpu_worker_process(
                     "var_Y": np.clip(1.0 - y_exp**2, 0.0, 1.0),
                     "var_Z": np.clip(1.0 - z_exp**2, 0.0, 1.0),
                 }
-                
+
                 zz_exp = zz_means_mf(state["Z"], intra_edges)
                 bulk_e = (
                     -current_hz * float(np.sum(state["Z"]))
@@ -437,37 +474,46 @@ def gpu_worker_process(
                     try:
                         depth = rcs_cfg["depth"]
                         shots = rcs_cfg["shots"]
-                        
-                        # Decorrelate the circuit sampling RNG
-                        rng_circuit = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
 
-                        # Snapshot #1: The intact Trotter state
+                        # PLANE-COHERENT MODE: seed on step only, so every patch
+                        # probed this round applies an IDENTICAL circuit (identical
+                        # sub-lattice topology makes this well-defined). Cross-patch
+                        # XEB deltas then isolate Trotter-state differences.
+                        # Otherwise: per-patch decorrelated circuit instances.
+                        if plane_coherent:
+                            rng_circuit = random.Random((master_seed << 32) ^ t)
+                        else:
+                            rng_circuit = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
+
+                        # Snapshot #1: Save the intact Trotter state
                         pristine_ket = sim.out_ket()
                         apply_rcs_layer(sim, QUBITS_PER_PATCH, intra_edges, depth, rng_circuit)
 
-                        # Snapshot #2: The intact RCS superposition
+                        # Snapshot #2: Save the intact RCS superposition
                         rcs_ket = sim.out_ket()
-                        
+
                         try:
                             # TRUE PORTER-THOMAS XEB:
-                            # measure_shots is destructive, collapsing the wavefunction. We must query
-                            # prob_perm() against the full superposition, so we restore immediately.
+                            # Step 1: Destructive measure_shots() collapses the wavefunction.
                             samples = sim.measure_shots(all_q, shots)
-                            
-                            # Restore the superposition so the probabilities are mathematically correct
+
+                            # Step 2: Restore the superposition immediately BEFORE querying probabilities.
                             sim.in_ket(rcs_ket)
                         finally:
+                            # Step 3: Free the temporary RCS state to prevent VRAM leaks.
                             del rcs_ket
-                        
+
+                        # Step 4: Calculate exact probabilities using the safely restored superposition.
                         ideal_p = np.array([
                             float(sim.prob_perm(all_q, [(int(bs) >> i) & 1 for i in range(QUBITS_PER_PATCH)]))
                             for bs in samples
                         ], dtype=np.float64)
-                        
-                        # HOG is disabled as the threshold saturates at large n (27 qubits) and converges to ~0.5
+
+                        # HOG is disabled as the threshold saturates at large n.
+                        # For n=27, log(2)/2^27 is ~5e-9, so nearly all sampled probabilities exceed it.
                         rcs_xeb, rcs_hog = calc_xeb(ideal_p, QUBITS_PER_PATCH, compute_hog=False)
                         lat_rcs = (time.perf_counter() - t0_rcs) * 1000.0
-                        
+
                         if is_snapshot:
                             print(f"[Worker {rank}] Snapshot RCS patch {patch_id} step {t}: "
                                   f"XEB={rcs_xeb:+.4f}", file=sys.stderr, flush=True)
@@ -475,13 +521,14 @@ def gpu_worker_process(
                     except Exception as e:
                         print(f"[Worker {rank}] RCS error patch {patch_id} step {t}: {e}", file=sys.stderr, flush=True)
                         rcs_xeb, rcs_hog = None, None
-                        
+
                     finally:
                         if pristine_ket is not None:
                             try:
+                                # Step 5: Restore the Trotter state for subsequent evolution
                                 sim.in_ket(pristine_ket)
                             except Exception as restore_e:
-                                print(f"[Worker {rank}] FATAL: Failed to restore ket on patch {patch_id}: {restore_e}", 
+                                print(f"[Worker {rank}] FATAL: Failed to restore ket on patch {patch_id}: {restore_e}",
                                       file=sys.stderr, flush=True)
                                 raise  # Propagate failure to prevent poisoning subsequent Trotter steps
                             finally:
@@ -501,8 +548,10 @@ def gpu_worker_process(
 
             if is_measure:
                 meas_count += 1
-                if routine_beat:
+                # Only advance the round schedule if it was a routine beat, not a snapshot override
+                if routine_beat and not is_snapshot:
                     rcs_round += 1
+                
                 conn.send(patch_data)
                 kick_payloads = conn.recv()
 
@@ -526,7 +575,7 @@ class MultiGpuHadronEngine:
         )
         self._bq_to_idx = {q: i for i, q in enumerate(self.all_boundary_qubits)}
         self._bq_arr    = np.array(self.all_boundary_qubits, dtype=np.intp)
-        
+
         face_sizes = {k: len(v) for k, v in self.boundaries.items()}
         if len(set(face_sizes.values())) != 1 or 0 in face_sizes.values():
             raise ValueError(f"Asymmetric or empty boundary faces detected: {face_sizes}.")
@@ -540,20 +589,57 @@ class MultiGpuHadronEngine:
                     idx += 1
         self.coord_to_patch = {v: k for k, v in self.patch_coords.items()}
         self.lattice_history: List[np.ndarray] = []
-        
+
         # Incorporate os.getpid() and a hyphen to eliminate parallel multi-instance collisions
         self.timestamp = f"{int(time.time())}-{os.getpid()}"
         self.config_file = f"lattice_config_{self.timestamp}.json"
-        
+
         self.state_file_prefix = f"macroscopic_lattice_states_multi_{self.timestamp}_part"
         self.state_file_suffix = ".npy"
         self._state_chunk_counter = 0
-        
-        self._init_files()
+
+        # --- DIAGONAL-PLANE SCHEDULE & WORKER ASSIGNMENT ---
+        # Anti-diagonal planes x+y+z = k. Plane sizes for 3x3x3: 1,3,6,7,6,3,1.
+        # k=2 and k=4 (size 6) saturate all 6 GPUs simultaneously.
+        self.patch_plane: Dict[int, int] = {
+            pid: sum(c) for pid, c in self.patch_coords.items()
+        }
+        max_plane = (GRID_X - 1) + (GRID_Y - 1) + (GRID_Z - 1)
+        if RCS_DIAG_SWEEP:
+            bad = [k for k in RCS_DIAG_PLANES if not (0 <= k <= max_plane)]
+            if bad:
+                raise ValueError(f"RCS_DIAG_PLANES contains invalid plane indices {bad} (valid: 0..{max_plane})")
+            self.probe_planes: List[List[int]] = [
+                sorted(pid for pid in range(TOTAL_PATCHES) if self.patch_plane[pid] == k)
+                for k in RCS_DIAG_PLANES
+            ]
+        else:
+            self.probe_planes = []
 
         self.worker_assignments: List[List[int]] = [[] for _ in range(TOTAL_WORKERS)]
-        for i in range(TOTAL_PATCHES):
-            self.worker_assignments[i % TOTAL_WORKERS].append(i)
+        if RCS_DIAG_SWEEP:
+            # Plane-aware round-robin: walk the sweep order with a rolling counter
+            # so consecutive patches within any plane of size <= TOTAL_WORKERS land
+            # on distinct GPUs (collision-free parallel probing). Only planes larger
+            # than TOTAL_WORKERS (k=3, size 7) double up one GPU. Any patch not in
+            # the configured sweep (e.g. RCS_DIAG_PLANES=[2,4]) is appended after,
+            # preserving overall balance.
+            ctr = 0
+            assigned: set = set()
+            for plane in self.probe_planes:
+                for pid in plane:
+                    if pid in assigned: continue
+                    self.worker_assignments[ctr % TOTAL_WORKERS].append(pid)
+                    assigned.add(pid); ctr += 1
+            for pid in range(TOTAL_PATCHES):
+                if pid not in assigned:
+                    self.worker_assignments[ctr % TOTAL_WORKERS].append(pid)
+                    assigned.add(pid); ctr += 1
+        else:
+            for i in range(TOTAL_PATCHES):
+                self.worker_assignments[i % TOTAL_WORKERS].append(i)
+
+        self._init_files()
 
     def _get_state_filepath(self, chunk_idx: int) -> str:
         return f"{self.state_file_prefix}{chunk_idx:0{STATE_CHUNK_DIGITS}d}{self.state_file_suffix}"
@@ -571,6 +657,11 @@ class MultiGpuHadronEngine:
                     "rcs_probes_per_worker": RCS_PROBES_PER_WORKER,
                     "rcs_probe_rotate": RCS_PROBE_ROTATE,
                     "rcs_full_snapshot_steps": RCS_FULL_SNAPSHOT_STEPS,
+                    "rcs_diag_sweep": RCS_DIAG_SWEEP,
+                    "rcs_diag_planes": RCS_DIAG_PLANES,
+                    "rcs_plane_coherent": RCS_PLANE_COHERENT,
+                    "probe_planes": self.probe_planes,
+                    "worker_assignments": self.worker_assignments,
                     "csv_chunk_size": CSV_CHUNK_SIZE,
                     "csv_chunk_digits": CSV_CHUNK_DIGITS,
                     "state_chunk_size": STATE_CHUNK_SIZE,
@@ -628,7 +719,7 @@ class MultiGpuHadronEngine:
         except Exception as e:
             print(f"[CSV] Profile log error on chunk {chunk_idx}: {e}", file=sys.stderr, flush=True)
 
-    def _log_rcs(self, step: int, anneal: float, rcs_records: List[Tuple[int, float, float, bool]]) -> None:
+    def _log_rcs(self, step: int, anneal: float, rcs_records: List[Tuple[int, float, float, bool, int]]) -> None:
         if not rcs_records: return
         # CSV chunk index is step-derived (not a monotonic counter) so readers can locate
         # data for a given step range without scanning all files.
@@ -639,14 +730,17 @@ class MultiGpuHadronEngine:
                 # f.tell() == 0 in append mode reliably returns True only for empty/new files on local POSIX filesystems
                 is_new = f.tell() == 0
                 w = csv.DictWriter(f, fieldnames=[
-                    "Step", "Anneal_Percent", "Patch", "RCS_Depth", "XEB_RCS", "HOG_RCS", "Is_Snapshot"
+                    "Step", "Anneal_Percent", "Patch", "Diag_Plane", "RCS_Depth",
+                    "XEB_RCS", "HOG_RCS", "Is_Snapshot", "Plane_Coherent"
                 ])
                 if is_new: w.writeheader()
-                for patch_id, xeb, hog, is_snap in rcs_records:
+                for patch_id, xeb, hog, is_snap, plane_k in rcs_records:
                     w.writerow({
                         "Step": step, "Anneal_Percent": anneal, "Patch": patch_id,
+                        "Diag_Plane": plane_k,
                         "RCS_Depth": RCS_DEPTH, "XEB_RCS": xeb, "HOG_RCS": "" if hog is None else hog,
-                        "Is_Snapshot": int(is_snap)
+                        "Is_Snapshot": int(is_snap),
+                        "Plane_Coherent": int(RCS_PLANE_COHERENT),
                     })
         except Exception as e:
             print(f"[CSV] RCS log error on chunk {chunk_idx}: {e}", file=sys.stderr, flush=True)
@@ -659,10 +753,13 @@ class MultiGpuHadronEngine:
 
         if total_steps < 1:   raise ValueError("total_steps must be >= 1")
         if measure_every < 1: raise ValueError("measure_every must be >= 1")
+        
+        if 0 in RCS_FULL_SNAPSHOT_STEPS:
+            raise ValueError("RCS_FULL_SNAPSHOT_STEPS cannot contain t=0 (baseline contamination on unevolved state).")
 
         if not all(s % measure_every == 0 for s in RCS_FULL_SNAPSHOT_STEPS):
             raise ValueError(f"All RCS_FULL_SNAPSHOT_STEPS must be multiples of measure_every ({measure_every})")
-            
+
         invalid_snaps = [s for s in RCS_FULL_SNAPSHOT_STEPS if s >= total_steps]
         if invalid_snaps:
             raise ValueError(
@@ -677,6 +774,8 @@ class MultiGpuHadronEngine:
             "probes_per_worker":    RCS_PROBES_PER_WORKER,
             "probe_rotate":         RCS_PROBE_ROTATE,
             "full_snapshot_steps":  RCS_FULL_SNAPSHOT_STEPS,
+            "probe_planes":         self.probe_planes,
+            "plane_coherent":       RCS_PLANE_COHERENT,
             "target_hx":            target_hx,
             "target_hz":            target_hz,
             "master_seed":          self.master_seed,
@@ -685,14 +784,24 @@ class MultiGpuHadronEngine:
         print(f"[Engine] {TOTAL_PATCHES} patches, {TOTAL_PATCHES * QUBITS_PER_PATCH} qubits, "
               f"{GPUS_AVAILABLE} GPUs, {total_steps} steps", file=sys.stderr, flush=True)
         print(f"[Master] Staggered init - expect ~{TOTAL_WORKERS * 10}s before first output.", file=sys.stderr, flush=True)
-        
+
         if RCS_VALIDATION_ENABLED:
-            n_probe = RCS_PROBES_PER_WORKER * TOTAL_WORKERS
-            print(f"[Engine] RCS ON: depth={RCS_DEPTH}, shots={RCS_SHOTS}, "
-                  f"{RCS_PROBES_PER_WORKER} probe(s)/GPU x {TOTAL_WORKERS} GPUs "
-                  f"= {n_probe} patches/round, rotation "
-                  f"{'ON' if RCS_PROBE_ROTATE else 'OFF'}, "
-                  f"every {RCS_VALIDATE_EVERY} measure steps", file=sys.stderr, flush=True)
+            if RCS_DIAG_SWEEP:
+                plane_sizes = [len(p) for p in self.probe_planes]
+                sweep_period = len(self.probe_planes) * RCS_VALIDATE_EVERY
+                print(f"[Engine] RCS ON (DIAG SWEEP): depth={RCS_DEPTH}, shots={RCS_SHOTS}, "
+                      f"planes x+y+z={RCS_DIAG_PLANES} sizes={plane_sizes}, "
+                      f"every {RCS_VALIDATE_EVERY} measure steps, "
+                      f"nominal full-cube sweep period = {sweep_period} measure steps (excluding snapshot interruptions), "
+                      f"circuits {'PLANE-COHERENT' if RCS_PLANE_COHERENT else 'per-patch decorrelated'}",
+                      file=sys.stderr, flush=True)
+            else:
+                n_probe = RCS_PROBES_PER_WORKER * TOTAL_WORKERS
+                print(f"[Engine] RCS ON: depth={RCS_DEPTH}, shots={RCS_SHOTS}, "
+                      f"{RCS_PROBES_PER_WORKER} probe(s)/GPU x {TOTAL_WORKERS} GPUs "
+                      f"= {n_probe} patches/round, rotation "
+                      f"{'ON' if RCS_PROBE_ROTATE else 'OFF'}, "
+                      f"every {RCS_VALIDATE_EVERY} measure steps", file=sys.stderr, flush=True)
             print(f"[Engine] Full-cube snapshots at steps: {RCS_FULL_SNAPSHOT_STEPS}", file=sys.stderr, flush=True)
 
         active_ranks = [r for r in range(TOTAL_WORKERS) if self.worker_assignments[r]]
@@ -716,10 +825,10 @@ class MultiGpuHadronEngine:
                 s              = t / max(1, total_steps - 1)
                 current_g_face = s * target_g_face
                 is_measure     = (t % measure_every == 0) or (t == total_steps - 1)
-                
+
                 # Snapshot evaluation decoupled from RCS results for correct telemetry tagging
                 is_snapshot_step = (t in RCS_FULL_SNAPSHOT_STEPS)
-                
+
                 if not is_measure:
                     continue
 
@@ -730,7 +839,7 @@ class MultiGpuHadronEngine:
                 bulk_energy      = 0.0
                 max_lat_trotter  = max_lat_tomo = max_lat_rcs = 0.0
                 min_fidelity     = 1.0
-                rcs_records: List[Tuple[int, float, float, bool]] = []
+                rcs_records: List[Tuple[int, float, float, bool, int]] = []
 
                 for conn in pipes:
                     # 300-second watchdog to accommodate rusticl JIT compilation overhead on massive snapshot steps
@@ -747,11 +856,12 @@ class MultiGpuHadronEngine:
                         max_lat_tomo    = max(max_lat_tomo, payload["lat_tomo_ms"])
                         max_lat_rcs     = max(max_lat_rcs, payload.get("lat_rcs_ms", 0.0))
                         min_fidelity    = min(min_fidelity, payload.get("unitary_fidelity", 1.0))
-                        
+
                         if payload.get("rcs_xeb") is not None:
                             is_snap = bool(payload.get("is_snapshot", False))
                             rcs_records.append((
-                                patch_id, payload["rcs_xeb"], payload["rcs_hog"], is_snap
+                                patch_id, payload["rcs_xeb"], payload["rcs_hog"], is_snap,
+                                self.patch_plane[patch_id]
                             ))
 
                 if len(patch_full_states) != TOTAL_PATCHES:
@@ -818,6 +928,9 @@ class MultiGpuHadronEngine:
                         ay1 = np.mean([prof1["means"]["Y"][self._bq_to_idx[q]] + noise1[q][1] for q in face1_q])
                         az1 = np.mean([prof1["means"]["Z"][self._bq_to_idx[q]] + noise1[q][2] for q in face1_q])
 
+                        # Note: Inter-patch coupling uses a Heisenberg-like (XYZ) interaction 
+                        # (ax1*ax2 + ay1*ay2 + az1*az2). This injects X and Y terms at the boundary, 
+                        # which is a deliberate phenomenological departure from the intra-patch TFIM (ZZ+X+Z).
                         macroscopic_boundary_energy += (
                             -current_g_face * (ax1*ax2 + ay1*ay2 + az1*az2) * ((len(face1_q) + len(face2_q)) / 2.0)
                         )
@@ -835,10 +948,15 @@ class MultiGpuHadronEngine:
                     xeb_mean = np.mean([r[1] for r in rcs_records])
                     hog_vals = [r[2] for r in rcs_records if r[2] is not None]
                     hog_str = f" HOG:{np.mean(hog_vals):.3f}" if hog_vals else ""
-                    rcs_tag = f" XEB:{xeb_mean:+.3f}{hog_str}[{len(rcs_records)}p]"
+                    if is_snapshot_step:
+                        plane_str = ""
+                    else:
+                        plane_ids = sorted({r[4] for r in rcs_records})
+                        plane_str = f" D{'/'.join(str(k) for k in plane_ids)}"
+                    rcs_tag = f" XEB:{xeb_mean:+.3f}{hog_str}[{len(rcs_records)}p{plane_str}]"
                 else:
                     rcs_tag = ""
-                    
+
                 print(f"[Master] Step {t:03d}{snap_tag} E:{total_energy:+.4f} "
                       f"Lat:{max_lat_trotter:.0f}/{max_lat_tomo:.0f}/{max_lat_rcs:.0f}ms "
                       f"Fid:{min_fidelity:.5f}{rcs_tag} ({time.perf_counter()-t0:.2f}s)",
