@@ -1,38 +1,18 @@
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place Loschmidt Echo Probe with Exact Ket Restoration (Rev 100)
+# + In-Place Loschmidt Echo Probe with Exact Ket Restoration (Rev 103)
 #
-# REVISION 100 - LOSCHMIDT ECHO PROBE & REVIEW FIXES
+# REVISION 103 - SAFETY LIMITS & CONFIG RESOLUTION
 #
-# CHANGES vs Rev 99:
-# - ECHO PROBE: The self-referential sampling XEB is replaced by a mirror
-#   circuit (C . C^dag) Loschmidt echo. Forward random circuit is recorded
-#   gate-by-gate, exactly inverted in reversed order, and echo fidelity
-#   F = |<psi_pristine|psi_mirror>|^2 is computed host-side via np.vdot.
-#   Exact simulation -> F = 1; SDRP rounding / precision loss over the
-#   2*depth circuit shows as decay. NOTE: mirror pairs can coherently
-#   cancel errors, so F_echo is an optimistic (upper) bound on forward-
-#   circuit fidelity.
-# - out_probs()/measure_shots() sampling path DELETED from the probe:
-#   removes the ~1 GB DMA burst and multi-GB host list allocation.
-# - iSWAP MIRROR SMOKE TEST at worker init autodetects native adjiswap()
-#   (fallback: iSWAP^dag = (Sdag x Sdag) . CZ . SWAP) and validates the
-#   full inverse convention, including U3^dag = U3(-theta, -lam, -phi).
-# - PROBE LIST FIX: RCS_PROBE_PATCHES now maps to exactly one patch per
-#   worker under round-robin assignment (i % TOTAL_WORKERS).
-# - SNAPSHOT GUARD FIX: full-snapshot steps may coincide with the final
-#   step (t == total_steps - 1), which is always a measure step.
-# - DEAD PARAM FIX: worker reads target_hx / target_hz from its function
-#   arguments; duplicates removed from rcs_cfg. Annealing schedule no
-#   longer depends on the RCS config dict.
-#
-# ARCHITECTURE (unchanged):
-# - IPC DELEGATION: Worker computes exact mathematical variance for Pauli
-#   observables (1 - <P>^2) and sends discrete `var_X/Y/Z` arrays.
-# - PROFILING ISOLATION: lat_rcs strictly bounds the echo probe logic
-#   (out_ket, forward, inverse, out_ket, vdot), excluding gc.collect()
-#   and in_ket() restore time.
+# CHANGES vs Rev 102:
+# - VARIANCE SAFETY: Native pauli_variance() calls are strictly clipped to 
+#   [0.0, 1.0] to prevent floating-point rounding errors from producing NaN
+#   results in downstream stochastic noise injection (sqrt).
+# - CONFIG RACE FIXED: Orchestrator writes configuration state to JSON
+#   after topology-aware assignment logic completes, logging actual nodes.
+# - NULL PROBE RESTORED: Setting RCS_PROBE_PATCHES = None safely defaults 
+#   back to probing all patches.
 
 import os
 import sys
@@ -61,9 +41,8 @@ TOTAL_WORKERS   = GPUS_AVAILABLE * WORKERS_PER_GPU
 RCS_VALIDATION_ENABLED  = True
 RCS_DEPTH               = 20
 RCS_VALIDATE_EVERY      = 5        # routine cadence: all probe patches every 5 measure steps
-# Exactly one patch per worker under round-robin (patch i -> worker i % 6):
-#   0->w0, 13->w1, 8->w2, 21->w3, 22->w4, 17->w5. Center patch 13 on w1.
-RCS_PROBE_PATCHES       = [0, 13, 8, 21, 22, 17]
+# "auto" guarantees exactly 1 probe per active GPU, dynamically selected.
+RCS_PROBE_PATCHES       = "auto" 
 RCS_FULL_SNAPSHOT_STEPS = [42, 82, 99] # all-patch echo: phase transition + final
 
 # =====================================================================
@@ -101,12 +80,7 @@ def generate_27q_lattice_subvolume() -> Tuple[List[Tuple[int, int]], Dict[str, L
 # =====================================================================
 def apply_rcs_layer(sim, num_qubits: int, edges: List[Tuple[int, int]],
                     depth: int, rng: random.Random) -> List[tuple]:
-    """Apply `depth` layers of random u + iswap gates in-place.
-
-    Returns the gate record needed by the inverse applier:
-        [("u", q, theta, phi, lam), ("iswap", q1, q2), ...]
-    in application order.
-    """
+    """Apply `depth` layers of random u + iswap gates in-place."""
     record: List[tuple] = []
     for _ in range(depth):
         for q in range(num_qubits):
@@ -127,13 +101,7 @@ def apply_rcs_layer(sim, num_qubits: int, edges: List[Tuple[int, int]],
 
 
 def make_rcs_inverse(adjiswap_native: bool):
-    """Build the inverse-applier, resolving the iswap-adjoint strategy once.
-
-    U3(theta, phi, lam)^dag = U3(-theta, -lam, -phi)   [phi/lam swap AND negate]
-    iSWAP^dag: native sim.adjiswap if available, else the decomposition
-        iSWAP = SWAP . CZ . (S x S)   (rightmost applied first)
-     => iSWAP^dag applies: SWAP, then CZ, then Sdag on both qubits.
-    """
+    """Build the inverse-applier, resolving the iswap-adjoint strategy once."""
     if adjiswap_native:
         def _inv_iswap(sim, q1, q2):
             sim.adjiswap(q1, q2)
@@ -196,6 +164,8 @@ def gpu_worker_process(
         # --- PAULI CODE AUTODETECT ---
         _THRESH = 0.5
         _probe_z = QrackSimulator(qubit_count=1, is_binary_decision_tree=False)
+        _HAS_PAULI_VARIANCE = hasattr(_probe_z, "pauli_variance")
+        
         vals0_z = {}
         for _code in range(8):
             try: vals0_z[_code] = _probe_z.pauli_expectation([0], [_code])
@@ -266,15 +236,11 @@ def gpu_worker_process(
         except Exception:
             pass
         del _vec_probe
-        print(f"[Worker {rank}] Vectorized r(): {'YES' if _VECTORIZED_R else 'NO (fallback to loop)'}",
+        print(f"[Worker {rank}] Vectorized r(): {'YES' if _VECTORIZED_R else 'NO (fallback)'} | "
+              f"Native Var(): {'YES' if _HAS_PAULI_VARIANCE else 'NO (fallback)'}",
               flush=True)
 
         # --- ISWAP MIRROR SMOKE TEST + adjiswap AUTODETECT ---
-        # Prepares a non-trivial two-qubit state, applies iswap then the
-        # chosen inverse, and demands echo >= 0.999. Catches a missing
-        # adjiswap, a wrong fallback decomposition, AND a wrong U3^dag
-        # convention (tested implicitly at full width by echo values,
-        # but the two-qubit iswap round-trip is validated here).
         _echo_probe = QrackSimulator(qubit_count=2, is_binary_decision_tree=False)
         _echo_probe.h(0)
         _echo_probe.u(1, 0.7, 1.1, 2.3)          # arbitrary non-trivial state
@@ -285,9 +251,6 @@ def gpu_worker_process(
             try:
                 _echo_probe.adjiswap(0, 1)
             except Exception:
-                # adjiswap advertised but broken: state may be corrupted;
-                # apply fallback anyway -- if state was altered, the
-                # fidelity check below fails loudly.
                 _adjiswap_native = False
                 _echo_probe.swap(0, 1)
                 _echo_probe.mcz([0], 1)
@@ -303,7 +266,10 @@ def gpu_worker_process(
         if _f_smoke < 0.999:
             raise RuntimeError(
                 f"Fatal: iswap mirror smoke test failed, F={_f_smoke:.6f}. "
-                f"adjiswap_native={_adjiswap_native}. Inverse convention wrong.")
+                f"adjiswap_native={_adjiswap_native}. "
+                f"Possible causes: broken adjiswap (state corrupted before fallback), "
+                f"or incorrect inverse convention."
+            )
         del _echo_probe, _ket_before, _ket_after
         apply_rcs_inverse = make_rcs_inverse(_adjiswap_native)
         print(f"[Worker {rank}] iSWAP inverse: "
@@ -352,8 +318,12 @@ def gpu_worker_process(
             return np.array([SIGN_X * float(sim.pauli_expectation([q], [PX])) for q in qubits])
         def y_means(sim, qubits):
             return np.array([SIGN_Y * float(sim.pauli_expectation([q], [PY])) for q in qubits])
-        def zz_means_mf(z_exp, edges):
-            return np.array([z_exp[q1] * z_exp[q2] for q1, q2 in edges])
+            
+        def zz_exact(sim, edges):
+            return np.array([
+                float(sim.pauli_expectation([q1, q2], [PZ, PZ]))
+                for q1, q2 in edges
+            ])
 
         def apply_kicks(sim, kicks, time_delta):
             if not kicks: return
@@ -401,8 +371,6 @@ def gpu_worker_process(
 
         for t in range(total_steps):
             s          = t / max(1, total_steps - 1)
-            # REV 100 FIX: annealing schedule reads target_hx / target_hz
-            # from function arguments, not rcs_cfg.
             current_hx = (1.0 - s) * initial_hx + s * target_hx
             current_J  = s * target_J
             current_hz = s * target_hz
@@ -433,22 +401,29 @@ def gpu_worker_process(
 
                 t0_tomo = time.perf_counter()
 
-                # Fetch exact expectation values
                 x_exp = x_means(sim, all_q)
                 y_exp = y_means(sim, all_q)
                 z_exp = z_means(sim, all_q)
+                
+                if _HAS_PAULI_VARIANCE:
+                    var_x_arr = np.clip([float(sim.pauli_variance([q], [PX])) for q in all_q], 0.0, 1.0)
+                    var_y_arr = np.clip([float(sim.pauli_variance([q], [PY])) for q in all_q], 0.0, 1.0)
+                    var_z_arr = np.clip([float(sim.pauli_variance([q], [PZ])) for q in all_q], 0.0, 1.0)
+                else:
+                    var_x_arr = np.clip(1.0 - x_exp**2, 0.0, 1.0)
+                    var_y_arr = np.clip(1.0 - y_exp**2, 0.0, 1.0)
+                    var_z_arr = np.clip(1.0 - z_exp**2, 0.0, 1.0)
 
                 state = {
                     "X": x_exp,
                     "Y": y_exp,
                     "Z": z_exp,
-                    # Exact variance mapping Var(P) = 1 - <P>^2
-                    "var_X": np.clip(1.0 - x_exp**2, 0.0, 1.0),
-                    "var_Y": np.clip(1.0 - y_exp**2, 0.0, 1.0),
-                    "var_Z": np.clip(1.0 - z_exp**2, 0.0, 1.0),
+                    "var_X": np.array(var_x_arr),
+                    "var_Y": np.array(var_y_arr),
+                    "var_Z": np.array(var_z_arr),
                 }
 
-                zz_exp = zz_means_mf(state["Z"], intra_edges)
+                zz_exp = zz_exact(sim, intra_edges)
                 bulk_e = (
                     -current_hz * float(np.sum(state["Z"]))
                     - current_J  * float(np.sum(zz_exp))
@@ -464,7 +439,6 @@ def gpu_worker_process(
                         print(f"[Worker {rank}] Warning: get_unitary_fidelity() unavailable.", file=sys.stderr)
                         _warned_fidelity = True
 
-                # --- LOSCHMIDT ECHO PROBE (Mirror Circuit C . C^dag) ---
                 echo_f, echo_n_gates = None, None
                 lat_rcs = 0.0
 
@@ -477,31 +451,18 @@ def gpu_worker_process(
                         rng = random.Random(
                             (master_seed << 32) ^ (patch_id << 16) ^ t)
 
-                        # 1. Snapshot pristine statevector (complex128,
-                        #    ~2 GB at 2^27; the transient Python list
-                        #    from out_ket is freed on conversion)
-                        pristine_ket = np.asarray(sim.out_ket(),
-                                                  dtype=np.complex128)
-
-                        # 2. Forward random circuit, recording gate stream
+                        pristine_ket = np.asarray(sim.out_ket(), dtype=np.complex128)
                         record = apply_rcs_layer(
                             sim, QUBITS_PER_PATCH, intra_edges, depth, rng)
                         echo_n_gates = len(record)
-
-                        # 3. Exact inverse in reversed order
                         apply_rcs_inverse(sim, record)
 
-                        # 4. Echo fidelity via host-side overlap.
-                        #    Norm-corrected as cheap insurance against
-                        #    non-normalized kets after SDRP rounding.
-                        final_ket = np.asarray(sim.out_ket(),
-                                               dtype=np.complex128)
+                        final_ket = np.asarray(sim.out_ket(), dtype=np.complex128)
                         ov  = np.vdot(pristine_ket, final_ket)
                         n1  = float(np.vdot(pristine_ket, pristine_ket).real)
                         n2  = float(np.vdot(final_ket, final_ket).real)
                         echo_f = float(abs(ov) ** 2 / max(n1 * n2, 1e-300))
 
-                        # Isolate actual algorithmic time from clean-up delays
                         lat_rcs = (time.perf_counter() - t0_rcs) * 1000.0
 
                         if is_snapshot:
@@ -515,10 +476,6 @@ def gpu_worker_process(
                         echo_f, echo_n_gates = None, None
 
                     finally:
-                        # 5. Fail-safe cleanup + EXACT state restoration.
-                        #    Even a perfect mirror leaves rounding
-                        #    contamination; in_ket() keeps the annealing
-                        #    trajectory deterministic and probe-independent.
                         if final_ket is not None:
                             del final_ket
                         if pristine_ket is not None:
@@ -529,7 +486,7 @@ def gpu_worker_process(
                                       file=sys.stderr)
                             finally:
                                 del pristine_ket
-                                gc.collect() # Nudge OS to reclaim memory blocks
+                                gc.collect() 
 
                 patch_data[patch_id] = {
                     "state":                  state,
@@ -569,7 +526,6 @@ class MultiGpuHadronEngine:
         self._bq_to_idx = {q: i for i, q in enumerate(self.all_boundary_qubits)}
         self._bq_arr    = np.array(self.all_boundary_qubits, dtype=np.intp)
 
-        # Hardened Topology Guard
         face_sizes = {k: len(v) for k, v in self.boundaries.items()}
         if len(set(face_sizes.values())) != 1 or 0 in face_sizes.values():
             raise ValueError(f"Asymmetric or empty boundary faces detected: {face_sizes}. "
@@ -591,11 +547,39 @@ class MultiGpuHadronEngine:
         self.state_dump   = "macroscopic_lattice_states.npy"
         self.config_file  = "lattice_config.json"
 
-        self._init_files()
-
         self.worker_assignments: List[List[int]] = [[] for _ in range(TOTAL_WORKERS)]
         for i in range(TOTAL_PATCHES):
             self.worker_assignments[i % TOTAL_WORKERS].append(i)
+            
+        # Topology-Aware Auto-Probes
+        if RCS_PROBE_PATCHES == "auto":
+            self.rcs_probe_patches = []
+            for i, w_patches in enumerate(self.worker_assignments):
+                if w_patches:
+                    # Alternate extracting corner, center, and edge patches 
+                    # from the worker queues to ensure structural diversity.
+                    if i % 3 == 0:
+                        self.rcs_probe_patches.append(w_patches[0])
+                    elif i % 3 == 1:
+                        self.rcs_probe_patches.append(w_patches[len(w_patches) // 2])
+                    else:
+                        self.rcs_probe_patches.append(w_patches[-1])
+            print(f"[Engine] Auto-selected topology-aware probe patches (1 per GPU): {self.rcs_probe_patches}")
+        else:
+            self.rcs_probe_patches = RCS_PROBE_PATCHES
+            
+        if self.rcs_probe_patches is not None and RCS_PROBE_PATCHES != "auto":
+            # Safely verify manual assignments didn't clump
+            owners = []
+            for patch in self.rcs_probe_patches:
+                owner_id = next((w_id for w_id, p_list in enumerate(self.worker_assignments) if patch in p_list), None)
+                if owner_id is not None:
+                    owners.append(owner_id)
+            if len(set(owners)) != len(self.rcs_probe_patches):
+                print(f"[Warning] Probe patches are clumped! {len(self.rcs_probe_patches)} patches map to only {len(set(owners))} GPUs. Expect idle compute.", file=sys.stderr)
+
+        # Initialize tracking files *after* probe patches are fully resolved
+        self._init_files()
 
     def _init_files(self) -> None:
         try:
@@ -606,7 +590,7 @@ class MultiGpuHadronEngine:
                     "qubits_per_patch": QUBITS_PER_PATCH,
                     "rcs_depth": RCS_DEPTH,
                     "rcs_validate_every": RCS_VALIDATE_EVERY,
-                    "rcs_probe_patches": RCS_PROBE_PATCHES,
+                    "rcs_probe_patches": self.rcs_probe_patches,
                     "rcs_full_snapshot_steps": RCS_FULL_SNAPSHOT_STEPS,
                     "probe_metric": "loschmidt_echo",
                 }, f)
@@ -694,9 +678,6 @@ class MultiGpuHadronEngine:
         if total_steps < 1:   raise ValueError("total_steps must be >= 1")
         if measure_every < 1: raise ValueError("measure_every must be >= 1")
 
-        # REV 100 FIX: the final step (total_steps - 1) is always a
-        # measure step in the worker, so it is a legitimate snapshot step
-        # even when it is not a multiple of measure_every.
         bad_cadence = [s for s in RCS_FULL_SNAPSHOT_STEPS
                        if (s % measure_every != 0) and (s != total_steps - 1)]
         if bad_cadence:
@@ -711,18 +692,16 @@ class MultiGpuHadronEngine:
                 f"RCS_FULL_SNAPSHOT_STEPS contains steps beyond total_steps={total_steps}: {invalid_snaps}"
             )
 
-        # REV 100 FIX: target_hx / target_hz removed from rcs_cfg -- the
-        # worker reads them from its function arguments.
         rcs_cfg = {
             "enabled":              RCS_VALIDATION_ENABLED,
             "depth":                RCS_DEPTH,
             "validate_every":       RCS_VALIDATE_EVERY,
-            "probe_patches":        RCS_PROBE_PATCHES,
+            "probe_patches":        self.rcs_probe_patches,
             "full_snapshot_steps":  RCS_FULL_SNAPSHOT_STEPS,
             "master_seed":          self.master_seed,
         }
 
-        n_probe = TOTAL_PATCHES if RCS_PROBE_PATCHES is None else len(RCS_PROBE_PATCHES)
+        n_probe = TOTAL_PATCHES if self.rcs_probe_patches is None else len(self.rcs_probe_patches)
         print(f"[Engine] {TOTAL_PATCHES} patches, "
               f"{TOTAL_PATCHES * QUBITS_PER_PATCH} qubits, "
               f"{GPUS_AVAILABLE} GPUs, {total_steps} steps")
@@ -897,9 +876,6 @@ class MultiGpuHadronEngine:
                     f"Fid: {min_fidelity:.5f}"
                 )
                 if rcs_records:
-                    # min is the headline: one degraded patch is the
-                    # signal, and the mean alone would wash it out across
-                    # 27 patches on snapshot steps.
                     min_echo  = min(r[1] for r in rcs_records)
                     mean_echo = float(np.mean([r[1] for r in rcs_records]))
                     n_rcs     = len(rcs_records)
