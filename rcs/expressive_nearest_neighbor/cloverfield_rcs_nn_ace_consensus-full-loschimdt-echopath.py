@@ -1,18 +1,19 @@
 # -*- coding: us-ascii -*-
 # 27-Qubit 3x3x3 Macroscopic Grid Annealing (27 Patches, 729 Qubits Total)
 # High-Throughput Volumetric Engine with Statistical Variance Injection
-# + In-Place Loschmidt Echo Probe with Exact Ket Restoration (Rev 103)
+# + In-Place Loschmidt Echo Probe with Exact Ket Restoration (Rev 104)
 #
-# REVISION 103 - SAFETY LIMITS & CONFIG RESOLUTION
+# REVISION 104 - HOT-PATH TOMO OPTIMIZATION & GPU-NATIVE ECHO
 #
-# CHANGES vs Rev 102:
-# - VARIANCE SAFETY: Native pauli_variance() calls are strictly clipped to 
-#   [0.0, 1.0] to prevent floating-point rounding errors from producing NaN
-#   results in downstream stochastic noise injection (sqrt).
-# - CONFIG RACE FIXED: Orchestrator writes configuration state to JSON
-#   after topology-aware assignment logic completes, logging actual nodes.
-# - NULL PROBE RESTORED: Setting RCS_PROBE_PATCHES = None safely defaults 
-#   back to probing all patches.
+# CHANGES vs Rev 103:
+# - TOMO BOTTLENECK REMOVED: Reverted exact ZZ correlators and native 
+#   pauli_variance back to fast NumPy vectorized approximations 
+#   (mean-field ZZ and pure-state 1 - <P>^2). The exact API calls forced 
+#   sequential 134M-amplitude scans over ctypes/Rusticl, locking the CPU.
+# - GPU-NATIVE ECHO: Replaced out_ket() DMA transfers with a purely 
+#   GPU-native Loschmidt echo proxy. The simulator context is forked in 
+#   VRAM via `clone_sid`, the mirror circuit runs on the fork, and fidelity 
+#   is measured via observable Mean Absolute Error (MAE) drift.
 
 import os
 import sys
@@ -164,7 +165,6 @@ def gpu_worker_process(
         # --- PAULI CODE AUTODETECT ---
         _THRESH = 0.5
         _probe_z = QrackSimulator(qubit_count=1, is_binary_decision_tree=False)
-        _HAS_PAULI_VARIANCE = hasattr(_probe_z, "pauli_variance")
         
         vals0_z = {}
         for _code in range(8):
@@ -236,9 +236,7 @@ def gpu_worker_process(
         except Exception:
             pass
         del _vec_probe
-        print(f"[Worker {rank}] Vectorized r(): {'YES' if _VECTORIZED_R else 'NO (fallback)'} | "
-              f"Native Var(): {'YES' if _HAS_PAULI_VARIANCE else 'NO (fallback)'}",
-              flush=True)
+        print(f"[Worker {rank}] Vectorized r(): {'YES' if _VECTORIZED_R else 'NO (fallback)'}", flush=True)
 
         # --- ISWAP MIRROR SMOKE TEST + adjiswap AUTODETECT ---
         _echo_probe = QrackSimulator(qubit_count=2, is_binary_decision_tree=False)
@@ -319,11 +317,12 @@ def gpu_worker_process(
         def y_means(sim, qubits):
             return np.array([SIGN_Y * float(sim.pauli_expectation([q], [PY])) for q in qubits])
             
-        def zz_exact(sim, edges):
-            return np.array([
-                float(sim.pauli_expectation([q1, q2], [PZ, PZ]))
-                for q1, q2 in edges
-            ])
+        # Optional off-path exact ZZ probe (commented out to preserve hot-path performance)
+        # def zz_exact(sim, edges):
+        #     return np.array([
+        #         float(sim.pauli_expectation([q1, q2], [PZ, PZ]))
+        #         for q1, q2 in edges
+        #     ])
 
         def apply_kicks(sim, kicks, time_delta):
             if not kicks: return
@@ -405,25 +404,22 @@ def gpu_worker_process(
                 y_exp = y_means(sim, all_q)
                 z_exp = z_means(sim, all_q)
                 
-                if _HAS_PAULI_VARIANCE:
-                    var_x_arr = np.clip([float(sim.pauli_variance([q], [PX])) for q in all_q], 0.0, 1.0)
-                    var_y_arr = np.clip([float(sim.pauli_variance([q], [PY])) for q in all_q], 0.0, 1.0)
-                    var_z_arr = np.clip([float(sim.pauli_variance([q], [PZ])) for q in all_q], 0.0, 1.0)
-                else:
-                    var_x_arr = np.clip(1.0 - x_exp**2, 0.0, 1.0)
-                    var_y_arr = np.clip(1.0 - y_exp**2, 0.0, 1.0)
-                    var_z_arr = np.clip(1.0 - z_exp**2, 0.0, 1.0)
+                # FAST: reuse already-computed single-qubit expectations
+                var_x_arr = np.clip(1.0 - x_exp**2, 0.0, 1.0)
+                var_y_arr = np.clip(1.0 - y_exp**2, 0.0, 1.0)
+                var_z_arr = np.clip(1.0 - z_exp**2, 0.0, 1.0)
 
                 state = {
                     "X": x_exp,
                     "Y": y_exp,
                     "Z": z_exp,
-                    "var_X": np.array(var_x_arr),
-                    "var_Y": np.array(var_y_arr),
-                    "var_Z": np.array(var_z_arr),
+                    "var_X": var_x_arr,
+                    "var_Y": var_y_arr,
+                    "var_Z": var_z_arr,
                 }
 
-                zz_exp = zz_exact(sim, intra_edges)
+                # FAST: mean-field ZZ from already-computed z_exp
+                zz_exp = np.array([z_exp[q1] * z_exp[q2] for q1, q2 in intra_edges])
                 bulk_e = (
                     -current_hz * float(np.sum(state["Z"]))
                     - current_J  * float(np.sum(zz_exp))
@@ -439,54 +435,56 @@ def gpu_worker_process(
                         print(f"[Worker {rank}] Warning: get_unitary_fidelity() unavailable.", file=sys.stderr)
                         _warned_fidelity = True
 
+                # --- LOSCHMIDT ECHO PROBE (GPU-Native Observable Proxy) ---
                 echo_f, echo_n_gates = None, None
                 lat_rcs = 0.0
 
                 if do_rcs and patch_id in rcs_probe_this_step:
                     t0_rcs = time.perf_counter()
-                    pristine_ket = None
-                    final_ket = None
                     try:
                         depth = rcs_cfg["depth"]
-                        rng = random.Random(
-                            (master_seed << 32) ^ (patch_id << 16) ^ t)
+                        rng = random.Random((master_seed << 32) ^ (patch_id << 16) ^ t)
 
-                        pristine_ket = np.asarray(sim.out_ket(), dtype=np.complex128)
-                        record = apply_rcs_layer(
-                            sim, QUBITS_PER_PATCH, intra_edges, depth, rng)
+                        # Fork the simulator context directly on the GPU.
+                        # This duplicates the VRAM state instantly and leaves the main `sim` pristine.
+                        sim_probe = QrackSimulator(clone_sid=sim.sid)
+
+                        # Forward random circuit and exact inverse on the fork
+                        record = apply_rcs_layer(sim_probe, QUBITS_PER_PATCH, intra_edges, depth, rng)
                         echo_n_gates = len(record)
-                        apply_rcs_inverse(sim, record)
+                        apply_rcs_inverse(sim_probe, record)
 
-                        final_ket = np.asarray(sim.out_ket(), dtype=np.complex128)
-                        ov  = np.vdot(pristine_ket, final_ket)
-                        n1  = float(np.vdot(pristine_ket, pristine_ket).real)
-                        n2  = float(np.vdot(final_ket, final_ket).real)
-                        echo_f = float(abs(ov) ** 2 / max(n1 * n2, 1e-300))
+                        # Measure exact observables on the echoed state
+                        x_after = x_means(sim_probe, all_q)
+                        y_after = y_means(sim_probe, all_q)
+                        z_after = z_means(sim_probe, all_q)
+
+                        # Calculate Mean Absolute Error (MAE) against pristine observables
+                        mae = float(np.mean([
+                            np.abs(state["X"] - x_after),
+                            np.abs(state["Y"] - y_after),
+                            np.abs(state["Z"] - z_after)
+                        ]))
+                        
+                        # Observable Fidelity Proxy: 1.0 means perfect recovery, drops as SDRP truncates
+                        echo_f = max(0.0, 1.0 - mae)
 
                         lat_rcs = (time.perf_counter() - t0_rcs) * 1000.0
 
                         if is_snapshot:
                             print(f"[Worker {rank}] Snapshot echo patch {patch_id}: "
-                                  f"F={echo_f:.6f} ({echo_n_gates} gates mirrored)",
+                                  f"Obs_F={echo_f:.6f} ({echo_n_gates} gates mirrored)",
                                   flush=True)
 
                     except Exception as e:
-                        print(f"[Worker {rank}] Echo probe error (patch {patch_id}): {e}",
-                              file=sys.stderr)
+                        print(f"[Worker {rank}] Echo probe error (patch {patch_id}): {e}", file=sys.stderr)
                         echo_f, echo_n_gates = None, None
 
                     finally:
-                        if final_ket is not None:
-                            del final_ket
-                        if pristine_ket is not None:
-                            try:
-                                sim.in_ket(pristine_ket)
-                            except Exception as restore_e:
-                                print(f"[Worker {rank}] FATAL: Failed to restore ket on patch {patch_id}: {restore_e}",
-                                      file=sys.stderr)
-                            finally:
-                                del pristine_ket
-                                gc.collect() 
+                        # Destroy the fork. The main annealing trajectory is untouched.
+                        if 'sim_probe' in locals():
+                            del sim_probe
+                            gc.collect()
 
                 patch_data[patch_id] = {
                     "state":                  state,
