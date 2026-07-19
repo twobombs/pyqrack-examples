@@ -198,11 +198,11 @@ def run_dashboard(mode="interactive"):
     # Human-readable metric label for axis/title use
     if probe_metric == "observable_mae":
         echo_label     = "Echo Obs-F"
-        echo_label_long = "Observable MAE Proxy  (1 - mean|ΔP|)"
+        echo_label_long = "Observable MAE Proxy  (1 - mean|dP|)"
         echo_vmin, echo_vmax = 0.0, 1.0
     else:
         echo_label     = "Echo Fidelity"
-        echo_label_long = "Loschmidt Echo Fidelity  F = |⟨ψ|C†C|ψ⟩|²"
+        echo_label_long = "Loschmidt Echo Fidelity  F = |<psi|C_dag C|psi>|^2"
         echo_vmin, echo_vmax = 0.0, 1.0
 
     if cfg_rcs_prob is None:
@@ -469,7 +469,7 @@ def run_dashboard(mode="interactive"):
     ax3d.grid(False); ax3d.set_axis_off()
 
     # ----------------------------------------------------------------
-    # Energy panel — now also shows Min_Unitary_Fidelity on secondary axis
+    # Energy panel -- now also shows Min_Unitary_Fidelity on secondary axis
     # ----------------------------------------------------------------
     ax_energy.plot(energies['Total'],    label='Total', color='lightgreen')
     ax_energy.plot(energies['Bulk'],     label='Bulk',  color='dodgerblue')
@@ -494,7 +494,7 @@ def run_dashboard(mode="interactive"):
     # ----------------------------------------------------------------
     # Echo time-series panel
     # Primary axis : Echo_Fidelity mean (cyan) + min (dashed cyan)
-    # Secondary axis: N_Gates mean (dim magenta) — sanity check that
+    # Secondary axis: N_Gates mean (dim magenta) -- sanity check that
     #                 gate counts are stable across the run
     # ----------------------------------------------------------------
     has_echo_data = not np.all(np.isnan(echo_mean))
@@ -632,7 +632,7 @@ def run_dashboard(mode="interactive"):
         mean_ef = float(np.nanmean(echo_arr))
         min_ef  = float(np.nanmin(echo_arr))
         cube_title_obj.set_text(
-            f"Echo Cube — step {best}  "
+            f"Echo Cube -- step {best}  "
             f"mean={mean_ef:.4f}  min={min_ef:.4f}")
 
     # ----------------------------------------------------------------
