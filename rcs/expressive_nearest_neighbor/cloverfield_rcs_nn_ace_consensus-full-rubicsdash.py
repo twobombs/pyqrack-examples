@@ -537,6 +537,200 @@ def draw_heatmap(ax, data, label, qpp):
 # MAIN
 # =====================================================================
 
+
+# =====================================================================
+# RCS SWEEP ANALYSIS PANELS
+# =====================================================================
+
+def _full_rcs_stats(xeb_arr):
+    """
+    Compute the same cross-patch statistics we do manually after a snapshot:
+      mean, std, min, max, range, median, per-plane mean.
+    Returns a dict; all values are floats or np.nan.
+    """
+    if xeb_arr is None:
+        return None
+    v = xeb_arr[~np.isnan(xeb_arr)]
+    if len(v) == 0:
+        return None
+    order   = sorted(range(TOTAL_PATCHES), key=lambda p: patch_plane(p))
+    pm      = {}
+    for k in range(7):
+        pids = [p for p in range(TOTAL_PATCHES) if patch_plane(p) == k]
+        vals = [xeb_arr[p] for p in pids if not np.isnan(xeb_arr[p])]
+        pm[k] = float(np.mean(vals)) if vals else np.nan
+    return {
+        "n":        len(v),
+        "mean":     float(np.mean(v)),
+        "std":      float(np.std(v)),
+        "min":      float(np.min(v)),
+        "max":      float(np.max(v)),
+        "range":    float(np.max(v) - np.min(v)),
+        "median":   float(np.median(v)),
+        "argmin":   int(np.nanargmin(xeb_arr)),
+        "argmax":   int(np.nanargmax(xeb_arr)),
+        "plane_mean": pm,
+    }
+
+
+def draw_xeb_histogram(ax, xeb_arr, snap_step):
+    """XEB value distribution histogram across all 27 patches."""
+    ax.cla(); ax.set_facecolor('#1a1a1a')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#333333')
+
+    if xeb_arr is None:
+        ax.text(0.5, 0.5, "Awaiting snapshot", ha='center', va='center',
+                transform=ax.transAxes, color='#555555', fontsize=9)
+        ax.set_title("XEB distribution", fontsize=8, color='#cccccc', pad=3)
+        return
+
+    v = xeb_arr[~np.isnan(xeb_arr)]
+    n_bins = min(14, max(5, len(v) // 2))
+    counts, edges, patches_h = ax.hist(
+        v, bins=n_bins, range=(XEB_NORM.vmin, XEB_NORM.vmax),
+        color='cyan', alpha=0.75, edgecolor='#1a1a1a', linewidth=0.5)
+
+    # Colour each bar by the XEB colormap
+    for patch_h, left in zip(patches_h, edges[:-1]):
+        mid = left + (edges[1] - edges[0]) / 2.0
+        patch_h.set_facecolor(XEB_CMAP(XEB_NORM(mid)))
+        patch_h.set_alpha(0.85)
+
+    stats = _full_rcs_stats(xeb_arr)
+    ax.axvline(stats["mean"],   color='white',  linewidth=1.2,
+               linestyle='--', label=f'mean={stats["mean"]:+.3f}')
+    ax.axvline(stats["median"], color='yellow', linewidth=0.8,
+               linestyle=':',  label=f'med={stats["median"]:+.3f}')
+    ax.axvline(1.0,             color='cyan',   linewidth=0.6,
+               linestyle=':',  label='PT=1.0')
+    ax.axvline(0.0,             color='#555555',linewidth=0.5, linestyle=':')
+
+    ax.set_xlim(XEB_NORM.vmin, XEB_NORM.vmax)
+    ax.set_xlabel("XEB", fontsize=7, color='#aaaaaa')
+    ax.set_ylabel("Patches", fontsize=7, color='#aaaaaa')
+    ax.tick_params(colors='#aaaaaa', labelsize=6)
+    ax.legend(fontsize=6, loc='upper right',
+              facecolor='#1a1a1a', labelcolor='#cccccc', framealpha=0.5)
+    ax.set_title(f"XEB distribution  (step {snap_step}, n={stats['n']})",
+                 fontsize=8, color='#cccccc', pad=3)
+
+
+def draw_xeb_ranked(ax, xeb_arr, snap_step):
+    """Per-patch XEB ranked bar chart, coloured by diagonal plane k."""
+    ax.cla(); ax.set_facecolor('#1a1a1a')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#333333')
+
+    if xeb_arr is None:
+        ax.text(0.5, 0.5, "Awaiting snapshot", ha='center', va='center',
+                transform=ax.transAxes, color='#555555', fontsize=9)
+        ax.set_title("XEB per patch (ranked)", fontsize=8,
+                     color='#cccccc', pad=3)
+        return
+
+    # Sort patches by XEB ascending
+    valid   = [(p, xeb_arr[p]) for p in range(TOTAL_PATCHES)
+               if not np.isnan(xeb_arr[p])]
+    valid.sort(key=lambda x: x[1])
+    pids    = [p for p, _ in valid]
+    vals    = [v for _, v in valid]
+    colors  = [PLANE_COLORS[patch_plane(p) % len(PLANE_COLORS)] for p in pids]
+    xlabels = [f"P{p}" for p in pids]
+
+    bars = ax.bar(range(len(vals)), vals, color=colors,
+                  width=0.8, edgecolor='#111111', linewidth=0.3)
+
+    ax.axhline(1.0, color='cyan',    linewidth=0.7, linestyle=':')
+    ax.axhline(0.0, color='#555555', linewidth=0.5, linestyle=':')
+
+    stats = _full_rcs_stats(xeb_arr)
+    ax.axhline(stats["mean"], color='white', linewidth=1.0,
+               linestyle='--', label=f'mean={stats["mean"]:+.3f}')
+    ax.axhspan(stats["mean"] - stats["std"],
+               stats["mean"] + stats["std"],
+               color='white', alpha=0.06, label=f'+/-1 std={stats["std"]:.3f}')
+
+    ax.set_xticks(range(len(vals)))
+    ax.set_xticklabels(xlabels, fontsize=4.5, rotation=90, color='#aaaaaa')
+    ax.set_ylabel("XEB", fontsize=7, color='#aaaaaa')
+    ax.set_ylim(min(XEB_NORM.vmin, min(vals) - 0.05),
+                max(XEB_NORM.vmax, max(vals) + 0.05))
+    ax.tick_params(colors='#aaaaaa', labelsize=6)
+    ax.legend(fontsize=6, loc='upper left',
+              facecolor='#1a1a1a', labelcolor='#cccccc', framealpha=0.5)
+    ax.set_title(f"XEB per patch (ranked, step {snap_step})  "
+                 f"colour=plane k",
+                 fontsize=8, color='#cccccc', pad=3)
+
+    # Annotate min/max
+    ax.annotate(f"min P{stats['argmin']}\n{stats['min']:+.3f}",
+                xy=(0, vals[0]),
+                xytext=(1.5, vals[0] - 0.12),
+                fontsize=5, color='#ff8888',
+                arrowprops=dict(arrowstyle='->', color='#ff8888', lw=0.6))
+    ax.annotate(f"max P{stats['argmax']}\n{stats['max']:+.3f}",
+                xy=(len(vals)-1, vals[-1]),
+                xytext=(len(vals)-6, vals[-1] + 0.05),
+                fontsize=5, color='#88ff88',
+                arrowprops=dict(arrowstyle='->', color='#88ff88', lw=0.6))
+
+
+def draw_rcs_sweep_stats(ax, xeb_arr, snap_step):
+    """
+    Text panel: full RCS sweep statistics table matching the manual
+    analysis from the audit session.
+    """
+    ax.cla(); ax.set_facecolor('#1a1a1a')
+    ax.set_axis_off()
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#333333')
+
+    if xeb_arr is None:
+        ax.text(0.5, 0.5, "Awaiting full-cube snapshot",
+                ha='center', va='center', transform=ax.transAxes,
+                color='#555555', fontsize=9)
+        ax.set_title("RCS sweep summary", fontsize=8,
+                     color='#cccccc', pad=3)
+        return
+
+    s = _full_rcs_stats(xeb_arr)
+    lines = [
+        f"Full-cube RCS sweep  --  step {snap_step}",
+        "",
+        f"  n patches   : {s['n']} / {TOTAL_PATCHES}",
+        f"  Mean XEB    : {s['mean']:+.4f}",
+        f"  Std  XEB    : {s['std']:.4f}",
+        f"  Median XEB  : {s['median']:+.4f}",
+        f"  Min  XEB    : {s['min']:+.4f}  (patch {s['argmin']}, "
+            f"k={patch_plane(s['argmin'])})",
+        f"  Max  XEB    : {s['max']:+.4f}  (patch {s['argmax']}, "
+            f"k={patch_plane(s['argmax'])})",
+        f"  XEB range   : {s['range']:.4f}",
+        "",
+        "  Mean XEB per diagonal plane (x+y+z=k):",
+    ]
+    for k in range(7):
+        pids = [p for p in range(TOTAL_PATCHES) if patch_plane(p) == k]
+        pm   = s["plane_mean"][k]
+        pm_s = f"{pm:+.4f}" if not np.isnan(pm) else "  N/A "
+        lines.append(f"    k={k}  (size={len(pids)})  :  {pm_s}")
+
+    lines += [
+        "",
+        "  Porter-Thomas ideal XEB = 1.000",
+        f"  Deviation from PT       : {s['mean'] - 1.0:+.4f}",
+        f"  |DeltaXEB| range        : {s['range']:.4f}",
+    ]
+
+    txt = "\n".join(lines)
+    ax.text(0.03, 0.97, txt, transform=ax.transAxes,
+            fontsize=7.5, color='#cccccc', va='top', ha='left',
+            family='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a1a',
+                      edgecolor='#333333', linewidth=0.5))
+    ax.set_title("RCS sweep summary", fontsize=8, color='#cccccc', pad=3)
+
 def main():
     import sys
     # Allow overriding the working directory via command-line argument:
@@ -570,18 +764,22 @@ def main():
         fontsize=12, color='#f5c518', y=0.99,
     )
 
-    # --- Layout ---
+    # --- Layout (4 rows) ---
     gs_top = gridspec.GridSpec(1, 3, figure=fig,
                                left=0.04, right=0.98,
-                               top=0.93, bottom=0.60,
+                               top=0.93, bottom=0.65,
                                wspace=0.28)
     gs_mid = gridspec.GridSpec(1, 3, figure=fig,
                                left=0.04, right=0.98,
-                               top=0.57, bottom=0.34,
+                               top=0.62, bottom=0.43,
                                wspace=0.30)
     gs_bot = gridspec.GridSpec(1, 3, figure=fig,
                                left=0.04, right=0.98,
-                               top=0.31, bottom=0.12,
+                               top=0.40, bottom=0.22,
+                               wspace=0.30)
+    gs_rcs = gridspec.GridSpec(1, 3, figure=fig,
+                               left=0.04, right=0.98,
+                               top=0.19, bottom=0.07,
                                wspace=0.30)
 
     ax_cube   = fig.add_subplot(gs_top[0], projection='3d')
@@ -593,9 +791,12 @@ def main():
     ax_hmx    = fig.add_subplot(gs_bot[0])
     ax_hmy    = fig.add_subplot(gs_bot[1])
     ax_hmz    = fig.add_subplot(gs_bot[2])
+    ax_hist   = fig.add_subplot(gs_rcs[0])
+    ax_ranked = fig.add_subplot(gs_rcs[1])
+    ax_sweep  = fig.add_subplot(gs_rcs[2])
 
     # XEB cube colorbar (shared, placed manually)
-    ax_cbar = fig.add_axes([0.002, 0.62, 0.008, 0.28])
+    ax_cbar = fig.add_axes([0.002, 0.67, 0.008, 0.24])
     sm = plt.cm.ScalarMappable(cmap=XEB_CMAP, norm=XEB_NORM)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=ax_cbar)
@@ -610,14 +811,14 @@ def main():
         fontsize=8, color='#aaaaaa', va='center')
 
     # --- Slider ---
-    ax_slider = fig.add_axes([0.10, 0.045, 0.70, 0.018])
+    ax_slider = fig.add_axes([0.10, 0.028, 0.70, 0.016])
     slider = Slider(ax_slider, 'Step', 0, num_steps - 1,
                     valinit=0, valstep=1, color='#4a90e2')
     slider.label.set_color('#cccccc')
     slider.valtext.set_color('#f5c518')
 
     # --- Play/Pause button ---
-    ax_btn = fig.add_axes([0.83, 0.036, 0.07, 0.032])
+    ax_btn = fig.add_axes([0.83, 0.020, 0.07, 0.030])
     btn = Button(ax_btn, '> Play',
                  color='#333333', hovercolor='#555555')
     btn.label.set_color('#cccccc')
@@ -678,6 +879,11 @@ def main():
             draw_heatmap(ax_hmy, blank, "Y", qpp)
             draw_heatmap(ax_hmz, blank, "Z", qpp)
 
+        # RCS sweep analysis row
+        draw_xeb_histogram(ax_hist,   xeb_arr, snap)
+        draw_xeb_ranked(ax_ranked,    xeb_arr, snap)
+        draw_rcs_sweep_stats(ax_sweep, xeb_arr, snap)
+
         # Status line
         stats = _xeb_stats_str(xeb_arr)
         status_txt.set_text(
@@ -721,7 +927,11 @@ def main():
 
     fig.canvas.mpl_connect('key_press_event', on_key)
 
-    # Initial draw
+    # Initial draw -- pre-populate RCS panels with latest snapshot if any
+    init_snap = max(snapshot_xeb.keys()) if snapshot_xeb else None
+    draw_xeb_histogram(ax_hist,   snapshot_xeb.get(init_snap), init_snap)
+    draw_xeb_ranked(ax_ranked,    snapshot_xeb.get(init_snap), init_snap)
+    draw_rcs_sweep_stats(ax_sweep, snapshot_xeb.get(init_snap), init_snap)
     redraw(0)
 
     print("[Dashboard] Window open.  SPACEBAR = screenshot.  Close window to quit.")
