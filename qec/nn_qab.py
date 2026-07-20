@@ -199,6 +199,7 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
         "depth":              depth,
         "long_range_columns": lrc,
         "long_range_rows":    lrr,
+        "sdrp":               sdrp,
         "depth":              depth,
         "xeb_ace":            xeb_ace,
         "hog_ace":            hog_ace,
