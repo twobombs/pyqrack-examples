@@ -173,7 +173,7 @@ def calc_stats(ideal_probs, counts, shots):
 # Benchmark
 # ---------------------------------------------------------------------------
 
-def bench_qrack(width, depth, sdrp=0.0):
+def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
     lcv_range    = range(width)
     all_bits     = list(lcv_range)
     n_inst       = 4
@@ -291,10 +291,9 @@ def bench_qrack(width, depth, sdrp=0.0):
                 _, q1, q2 = gate_tuple
                 instance_circuit.append((fn, shift_map[q1], shift_map[q2]))
 
-        sim = QrackAceBackend(width)
+        sim = QrackAceBackend(width, long_range_columns=lrc, long_range_rows=lrr)
         if sdrp > 0.0:
-            for s in sim.sim:
-                s.set_sdrp(sdrp)
+            sim.set_sdrp(sdrp)
         run_circuit(sim, instance_circuit)
 
         raw_samples = sim.measure_shots(all_bits, shots_per)
@@ -309,11 +308,13 @@ def bench_qrack(width, depth, sdrp=0.0):
     t_elapsed = time.perf_counter() - t_ideal
 
     return {
-        "width":         width,
-        "depth":         depth,
-        "sdrp":          sdrp,
-        "xeb_ace":       xeb_ace,
-        "hog_ace":       hog_ace,
+        "width":              width,
+        "depth":              depth,
+        "long_range_columns": lrc,
+        "long_range_rows":    lrr,
+        "depth":              depth,
+        "xeb_ace":            xeb_ace,
+        "hog_ace":            hog_ace,
     }
 
 
@@ -324,11 +325,13 @@ def bench_qrack(width, depth, sdrp=0.0):
 def main():
     if len(sys.argv) < 3:
         raise RuntimeError(
-            "Usage: python3 nn_qab_consensus.py [width] [depth] [sdrp=0.1464466]")
+            "Usage: python3 nn_qab_consensus.py [width] [depth] [long_range_columns=4] [long_range_rows=4] [sdrp=0.1464466]")
     width = int(sys.argv[1])
     depth = int(sys.argv[2])
-    sdrp  = float(sys.argv[3]) if len(sys.argv) > 3 else ((1 - 1 / math.sqrt(2)) / 2)
-    result = bench_qrack(width, depth, sdrp)
+    lrc = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+    lrr = int(sys.argv[4]) if len(sys.argv) > 4 else 4
+    sdrp  = float(sys.argv[5]) if len(sys.argv) > 5 else ((1 - 1 / math.sqrt(2)) / 2)
+    result = bench_qrack(width, depth, lrc, lrr, sdrp)
     for k, v in result.items():
         print(f"  {k}: {v}")
     return 0
