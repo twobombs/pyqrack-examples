@@ -862,6 +862,14 @@ def main():
     ax_slider = fig.add_axes([0.10, 0.028, 0.70, 0.016])
     slider = Slider(ax_slider, 'Step', 0, num_steps - 1,
                     valinit=0, valstep=1, color='#4a90e2')
+    
+    # Strip the default solid background to make the slider track transparent
+    ax_slider.set_facecolor('none')
+    if hasattr(slider, 'track'):
+        slider.track.set_facecolor('none')
+        # Adds a subtle edge border so the timeline length remains visible
+        slider.track.set_edgecolor('#333333')
+
     slider.label.set_color('#cccccc')
     slider.valtext.set_color('#f5c518')
 
