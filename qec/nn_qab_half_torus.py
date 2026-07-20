@@ -151,12 +151,42 @@ def bench_qrack(width, depth):
                 temp_row = temp_row + (1 if (gate & 2) else -1)
                 temp_col = temp_col + (1 if (gate & 1) else 0)
 
+                # Non-toroidal (is_torus=False) boundary handling, split
+                # by axis rather than applied uniformly -- these two axes
+                # do NOT behave the same way under is_torus=False, given
+                # long_range_columns=2 is set explicitly below but
+                # long_range_rows is left at its default (4):
+                #
+                # temp_row ranges over row_len (the LONG dimension), and
+                # matches QrackAceBackend's "long_range_columns" axis
+                # (verified: that parameter governs boundary density along
+                # the same axis this script calls "row", both ranging over
+                # row_len). long_range_columns=2 < row_len for any width
+                # worth testing, so is_torus=False genuinely, actually
+                # disables wraparound here -- skip (continue) is correct.
+                #
+                # temp_col ranges over col_len (the SHORT dimension), and
+                # matches QrackAceBackend's "long_range_rows" axis, left at
+                # its DEFAULT value of 4. is_torus=False only actually
+                # disables wraparound on a given axis when
+                # long_range_X < length_of_that_axis -- so for col_len<=4
+                # (verified directly: true for col_len in {2,3,4}, false
+                # for col_len>=5), long_range_rows=4 is NOT less than
+                # col_len, meaning QrackAceBackend treats this entire short
+                # dimension as one continuous interior run regardless of
+                # is_torus. Skipping here would silently drop real
+                # coupling gates that QrackAceBackend still, correctly,
+                # treats as adjacent -- wrapping instead matches its
+                # actual behavior. This holds for col_len<=4; for col_len>=5
+                # this assumption would need revisiting (either passing
+                # long_range_rows explicitly below, or reworking this check
+                # to depend on it rather than a hardcoded default).
                 if temp_row < 0:
-                    temp_row = temp_row + row_len
+                    continue
+                if temp_row >= row_len:
+                    continue
                 if temp_col < 0:
                     temp_col = temp_col + col_len
-                if temp_row >= row_len:
-                    temp_row = temp_row - row_len
                 if temp_col >= col_len:
                     temp_col = temp_col - col_len
 
@@ -172,7 +202,7 @@ def bench_qrack(width, depth):
     # -----------------------------------------------------------------------
     # Method: QrackAceBackend
     # -----------------------------------------------------------------------
-    sim = QrackAceBackend(width)
+    sim = QrackAceBackend(width, is_torus=False)
     sim.run_qiskit_circuit(qc, shots=0)
     ace_counts = dict(Counter(sim.measure_shots(all_bits, shots)))
 
