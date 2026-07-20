@@ -186,9 +186,15 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
                 if temp_row >= row_len:
                     continue
                 if temp_col < 0:
-                    temp_col = temp_col + col_len
+                    if (row_len < 3) or (row_len <= lrr):
+                        temp_col = temp_col + col_len
+                    else:
+                        continue
                 if temp_col >= col_len:
-                    temp_col = temp_col - col_len
+                    if (row_len < 3) or (row_len <= lrr):
+                        temp_col = temp_col - col_len
+                    else:
+                        continue
 
                 b1 = col * row_len + row
                 b2 = temp_col * row_len + temp_row
