@@ -34,10 +34,10 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.colors as mcolors
 import matplotlib.animation as animation
-from matplotlib.widgets import Slider, Button
 from matplotlib.collections import PolyCollection
 from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from matplotlib.widgets import Slider, Button
 
 # =====================================================================
 # CONFIGURATION
@@ -47,6 +47,9 @@ TOTAL_PATCHES            = GRID_X * GRID_Y * GRID_Z
 QUBITS_PER_PATCH         = 27
 SCREENSHOT_DPI           = 300
 SNAPSHOT_COLOR           = "#f5c518"
+
+# Tuning parameter for how harshly macroscopic boundary disagreement penalizes XEB
+KICK_TAX_LAMBDA          = 5.0  
 
 # XEB colour ramp: deep-blue -> dark -> cyan -> gold -> red
 XEB_CMAP = mcolors.LinearSegmentedColormap.from_list(
@@ -237,8 +240,9 @@ def load_rcs(cfg, num_steps):
     return df, snapshot_xeb, routine_mean, plane_mean
 
 def compute_disagreement(history, num_steps):
+    dis = np.zeros(num_steps)
     if history is None:
-        return np.zeros(num_steps)
+        return dis
     interfaces = []
     def pid(x,y,z): return (x*GRID_Y + y)*GRID_Z + z
     for x in range(GRID_X):
@@ -258,19 +262,27 @@ def compute_disagreement(history, num_steps):
                     i2 = np.array([x*9+yy*3   for yy in range(3)])
                     interfaces.append((p1, pid(x,y,z+1), i1, i2))
     if not interfaces:
-        return np.zeros(num_steps)
+        return dis
+        
     ns = min(history.shape[0], num_steps)
-    dis = np.zeros(ns)
     for p1, p2, i1, i2 in interfaces:
         diff = history[:ns, p1][:, i1, :] - history[:ns, p2][:, i2, :]
-        dis += np.mean(np.linalg.norm(diff, axis=2), axis=1)
-    return dis / len(interfaces)
+        dis[:ns] += np.mean(np.linalg.norm(diff, axis=2), axis=1)
+    
+    dis[:ns] /= len(interfaces)
+    
+    # Forward fill missing steps if history array is shorter than target num_steps
+    if ns < num_steps and ns > 0:
+        dis[ns:] = dis[ns-1]
+        
+    return dis
 
 # =====================================================================
 # RUBIK'S CUBE DRAWING
 # =====================================================================
 # Each patch rendered as a coloured square face on the +Z top surface of its
-# cell, with thin dark side-faces to give 3-D depth.  Uses Poly3DCollection.
+# cell, with thin dark side-faces to give 3-D depth. Uses a single
+# Poly3DCollection to ensure correct depth z-sorting across all layers.
 
 def _cell_faces(x, y, z, s=0.46):
     """Return (top_verts, side_verts_list) for a unit cell at (x,y,z)."""
@@ -297,32 +309,46 @@ def draw_rubiks_cube(ax, xeb_arr):
     ax.set_facecolor('#111111')
     ax.set_axis_off()
 
-    top_verts, top_colors = [], []
-    side_verts = []
+    all_verts = []
+    all_facecolors = []
+    all_edgecolors = []
+    all_linewidths = []
 
     for pid in range(TOTAL_PATCHES):
         x, y, z = patch_coords(pid)
         top, sides = _cell_faces(x, y, z)
 
         val = xeb_arr[pid] if xeb_arr is not None else np.nan
+        
+        # Apply alpha (transparency) channels to the colors
         if np.isnan(val):
-            fc = (0.15, 0.15, 0.15, 1.0)
+            fc = (0.15, 0.15, 0.15, 0.65)
         else:
-            fc = XEB_CMAP(XEB_NORM(val))
+            r, g, b, _ = XEB_CMAP(XEB_NORM(val))
+            fc = (r, g, b, 0.85)  # Make top faces slightly transparent
 
-        top_verts.append(top)
-        top_colors.append(fc)
-        side_verts.extend(sides)
+        # Add Side faces: dark grey, heavily transparent to see internal structure
+        for side in sides:
+            all_verts.append(side)
+            all_facecolors.append((0.12, 0.12, 0.12, 0.15))
+            all_edgecolors.append((0.30, 0.30, 0.30, 0.40))
+            all_linewidths.append(0.3)
 
-    # Side faces: dark grey
-    sc = Poly3DCollection(side_verts, facecolor=(0.12,0.12,0.12,1.0),
-                          edgecolor=(0.25,0.25,0.25,1.0), linewidth=0.4)
-    ax.add_collection3d(sc)
+        # Add Top faces (XEB coloured)
+        all_verts.append(top)
+        all_facecolors.append(fc)
+        all_edgecolors.append((0.40, 0.40, 0.40, 0.80))
+        all_linewidths.append(0.5)
 
-    # Top faces (XEB coloured) -- drawn after sides so they appear on top
-    tc = Poly3DCollection(top_verts, facecolors=top_colors,
-                          edgecolor=(0.30,0.30,0.30,1.0), linewidth=0.5)
-    ax.add_collection3d(tc)
+    # Creating a single combined collection ensures mplot3d calculates 
+    # the centroid of each face individually for accurate back-to-front sorting.
+    cube_collection = Poly3DCollection(
+        all_verts,
+        facecolors=all_facecolors,
+        edgecolors=all_edgecolors,
+        linewidths=all_linewidths
+    )
+    ax.add_collection3d(cube_collection)
 
     ax.set_xlim(-0.6, 2.6); ax.set_ylim(-0.6, 2.6); ax.set_zlim(-0.6, 2.6)
     try:
@@ -415,7 +441,7 @@ def draw_plane_bar(ax, pm_arr):
     ax.axhline(1.0, color='cyan', linewidth=0.8, linestyle=':', label='PT')
     ax.axhline(0.0, color='#666666', linewidth=0.6, linestyle=':')
     ax.set_ylim(XEB_NORM.vmin, XEB_NORM.vmax + 0.3)
-    ax.set_title("Mean XEB per plane", fontsize=8, color='#cccccc', pad=3)
+    ax.set_title("Effective Mean XEB per plane", fontsize=8, color='#cccccc', pad=3)
     ax.tick_params(colors='#aaaaaa', labelsize=7)
     ax.set_facecolor('#1a1a1a')
     for sp in ax.spines.values():
@@ -466,7 +492,7 @@ def draw_rcs_ts(ax, routine_mean, df_rcs, snap_steps, num_steps,
                 step_cursor, cfg):
     ax.cla(); ax.set_facecolor('#1a1a1a')
     xs = list(range(num_steps))
-    ax.plot(xs, routine_mean, color='cyan', linewidth=1.2, label='Mean XEB')
+    ax.plot(xs, routine_mean, color='cyan', linewidth=1.2, label='Eff Mean XEB')
     ax.axhline(1.0, color='cyan', linewidth=0.5, linestyle=':', alpha=0.5)
     ax.axhline(0.0, color='#555555', linewidth=0.5, linestyle=':')
 
@@ -486,7 +512,7 @@ def draw_rcs_ts(ax, routine_mean, df_rcs, snap_steps, num_steps,
     ax.axvline(step_cursor, color='white', linewidth=0.8, linestyle='--')
     depth = cfg.get("rcs_depth","?"); shots = cfg.get("rcs_shots","?")
     ev    = cfg.get("rcs_validate_every","?")
-    ax.set_title(f"RCS XEB  depth={depth} shots={shots} every={ev}",
+    ax.set_title(f"Effective RCS XEB  depth={depth} shots={shots} every={ev}",
                  fontsize=8, color='#cccccc', pad=3)
     ax.legend(fontsize=5, loc='upper left', ncol=4,
               facecolor='#1a1a1a', labelcolor='#cccccc', framealpha=0.5)
@@ -607,12 +633,12 @@ def draw_xeb_histogram(ax, xeb_arr, snap_step):
     ax.axvline(0.0,             color='#555555',linewidth=0.5, linestyle=':')
 
     ax.set_xlim(XEB_NORM.vmin, XEB_NORM.vmax)
-    ax.set_xlabel("XEB", fontsize=7, color='#aaaaaa')
+    ax.set_xlabel("Effective XEB", fontsize=7, color='#aaaaaa')
     ax.set_ylabel("Patches", fontsize=7, color='#aaaaaa')
     ax.tick_params(colors='#aaaaaa', labelsize=6)
     ax.legend(fontsize=6, loc='upper right',
               facecolor='#1a1a1a', labelcolor='#cccccc', framealpha=0.5)
-    ax.set_title(f"XEB distribution  (step {snap_step}, n={stats['n']})",
+    ax.set_title(f"Effective XEB distribution  (step {snap_step}, n={stats['n']})",
                  fontsize=8, color='#cccccc', pad=3)
 
 
@@ -625,7 +651,7 @@ def draw_xeb_ranked(ax, xeb_arr, snap_step):
     if xeb_arr is None:
         ax.text(0.5, 0.5, "Awaiting snapshot", ha='center', va='center',
                 transform=ax.transAxes, color='#555555', fontsize=9)
-        ax.set_title("XEB per patch (ranked)", fontsize=8,
+        ax.set_title("Effective XEB per patch (ranked)", fontsize=8,
                      color='#cccccc', pad=3)
         return
 
@@ -652,14 +678,14 @@ def draw_xeb_ranked(ax, xeb_arr, snap_step):
                color='white', alpha=0.06, label=f'+/-1 std={stats["std"]:.3f}')
 
     ax.set_xticks(range(len(vals)))
-    ax.set_xticklabels(xlabels, fontsize=4.5, rotation=90, color='#aaaaaa')
-    ax.set_ylabel("XEB", fontsize=7, color='#aaaaaa')
+    ax.set_xticklabels([f"P{p}" for p in pids], fontsize=4.5, rotation=90, color='#aaaaaa')
+    ax.set_ylabel("Effective XEB", fontsize=7, color='#aaaaaa')
     ax.set_ylim(min(XEB_NORM.vmin, min(vals) - 0.05),
                 max(XEB_NORM.vmax, max(vals) + 0.05))
     ax.tick_params(colors='#aaaaaa', labelsize=6)
     ax.legend(fontsize=6, loc='upper left',
               facecolor='#1a1a1a', labelcolor='#cccccc', framealpha=0.5)
-    ax.set_title(f"XEB per patch (ranked, step {snap_step})  "
+    ax.set_title(f"Effective XEB per patch (ranked, step {snap_step})  "
                  f"colour=plane k",
                  fontsize=8, color='#cccccc', pad=3)
 
@@ -690,13 +716,13 @@ def draw_rcs_sweep_stats(ax, xeb_arr, snap_step):
         ax.text(0.5, 0.5, "Awaiting full-cube snapshot",
                 ha='center', va='center', transform=ax.transAxes,
                 color='#555555', fontsize=9)
-        ax.set_title("RCS sweep summary", fontsize=8,
+        ax.set_title("Effective RCS sweep summary", fontsize=8,
                      color='#cccccc', pad=3)
         return
 
     s = _full_rcs_stats(xeb_arr)
     lines = [
-        f"Full-cube RCS sweep  --  step {snap_step}",
+        f"Effective Full-cube RCS sweep  --  step {snap_step}",
         "",
         f"  n patches   : {s['n']} / {TOTAL_PATCHES}",
         f"  Mean XEB    : {s['mean']:+.4f}",
@@ -729,7 +755,7 @@ def draw_rcs_sweep_stats(ax, xeb_arr, snap_step):
             family='monospace',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#1a1a1a',
                       edgecolor='#333333', linewidth=0.5))
-    ax.set_title("RCS sweep summary", fontsize=8, color='#cccccc', pad=3)
+    ax.set_title("Effective RCS sweep summary", fontsize=8, color='#cccccc', pad=3)
 
 def main():
     import sys
@@ -751,7 +777,28 @@ def main():
     df_e                                         = load_energy(cfg, num_steps)
     df_rcs, snapshot_xeb, routine_mean, plane_mean = load_rcs(cfg, num_steps)
     print(f"[Snapshot] keys loaded: {sorted(snapshot_xeb.keys())}")
-    avg_dis    = compute_disagreement(history, num_steps)
+    
+    # -----------------------------------------------------------
+    # APPLY ANALYTICAL XEB DISCOUNT (KICK TAX)
+    # -----------------------------------------------------------
+    avg_dis = compute_disagreement(history, num_steps)
+    kick_tax_penalty = np.exp(-KICK_TAX_LAMBDA * avg_dis)
+    
+    routine_mean = routine_mean * kick_tax_penalty
+    
+    for step in snapshot_xeb:
+        safe_step = int(step)
+        if safe_step < num_steps:
+            p_val = kick_tax_penalty[safe_step]
+            snapshot_xeb[step] = snapshot_xeb[step] * p_val
+            if step in plane_mean:
+                plane_mean[step] = plane_mean[step] * p_val
+                
+    if not df_rcs.empty:
+        penalty_map = {s: kick_tax_penalty[int(s)] if int(s) < num_steps else 1.0 
+                       for s in df_rcs["Step"].unique()}
+        df_rcs["XEB_RCS"] = df_rcs["XEB_RCS"] * df_rcs["Step"].map(penalty_map)
+    # -----------------------------------------------------------
 
     plt.style.use('dark_background')
     fig = plt.figure(figsize=(24, 13), facecolor='#111111')
@@ -760,7 +807,8 @@ def main():
         f"{GRID_X}x{GRID_Y}x{GRID_Z} grid | "
         f"{TOTAL_PATCHES} patches | "
         f"{TOTAL_PATCHES * QUBITS_PER_PATCH} qubits | "
-        f"{num_steps} steps",
+        f"{num_steps} steps | "
+        f"Kick Tax Lambda: {KICK_TAX_LAMBDA}",
         fontsize=12, color='#f5c518', y=0.99,
     )
 
@@ -800,7 +848,7 @@ def main():
     sm = plt.cm.ScalarMappable(cmap=XEB_CMAP, norm=XEB_NORM)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=ax_cbar)
-    cbar.set_label('XEB', fontsize=8, color='#cccccc')
+    cbar.set_label('Effective XEB (Taxed)', fontsize=8, color='#cccccc')
     cbar.ax.tick_params(labelsize=7, colors='#aaaaaa')
 
     # --- Status text ---
