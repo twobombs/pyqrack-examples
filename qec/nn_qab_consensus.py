@@ -292,8 +292,7 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
                 instance_circuit.append((fn, shift_map[q1], shift_map[q2]))
 
         sim = QrackAceBackend(width, long_range_columns=lrc, long_range_rows=lrr)
-        if sdrp > 0.0:
-            sim.set_sdrp(sdrp)
+        sim.set_sdrp(sdrp)
         run_circuit(sim, instance_circuit)
 
         raw_samples = sim.measure_shots(all_bits, shots_per)

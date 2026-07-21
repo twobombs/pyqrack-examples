@@ -173,8 +173,7 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
     # Method: QrackAceBackend
     # -----------------------------------------------------------------------
     sim = QrackAceBackend(width, long_range_columns=lrc, long_range_rows=lrr)
-    if sdrp > 0:
-        sim.set_sdrp(sdrp)
+    sim.set_sdrp(sdrp)
     sim.run_qiskit_circuit(qc, shots=0)
     ace_counts = dict(Counter(sim.measure_shots(all_bits, shots)))
 
