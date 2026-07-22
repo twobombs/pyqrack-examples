@@ -11,8 +11,9 @@ import time
 from collections import Counter
 
 import numpy as np
-from pyqrack import QrackSimulator, QrackAceBackend
-from qiskit import QuantumCircuit
+from pyqrack import QrackSimulator
+from qiskit.providers.qrack.backends import AceQasmSimulator
+from qiskit import QuantumCircuit, transpile
 
 
 def factor_width(width):
@@ -130,7 +131,7 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
     # Build circuit in Qiskit
     # -----------------------------------------------------------------------
     t_circ = time.perf_counter()
-    qc = QuantumCircuit(width, width)
+    qc = QuantumCircuit(width)
 
     for _ in range(depth):
         # Single-qubit gates
@@ -208,13 +209,22 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
     # -----------------------------------------------------------------------
     # Method: QrackAceBackend
     # -----------------------------------------------------------------------
-    sim = QrackAceBackend(width, long_range_columns=lrc, long_range_rows=lrr, is_torus=False)
-    sim.set_sdrp(sdrp)
-    sim.run_qiskit_circuit(qc, shots=0)
-    ace_counts = dict(Counter(sim.measure_shots(all_bits, shots)))
+    sim = AceQasmSimulator(n_qubits=width, long_range_columns=lrc, long_range_rows=lrr, sdrp=sdrp, is_torus=False)
+    qc = transpile(qc, backend=sim, optimization_level=3)
+
+    t_trans = time.perf_counter()
+    print(f"transpile_seconds: {t_trans - t_circ:.4f}")
+
+    qcm = qc.copy()
+    qcm.measure_all()
+    ace_str_counts = dict(sim.run(qcm, shots=shots).result().get_counts())
+    ace_counts = {}
+    for s, count in ace_str_counts.items():
+        ace_counts[int(s, 2)] = count
+    
 
     t_ace = time.perf_counter()
-    print(f"ace_seconds: {t_ace - t_circ:.4f}")
+    print(f"ace_seconds: {t_ace - t_trans:.4f}")
 
     # -----------------------------------------------------------------------
     # Ideal ground truth via QrackSimulator
@@ -247,12 +257,12 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
 
 def main():
     if len(sys.argv) < 3:
-        raise RuntimeError("Usage: python3 nn_qab_half_torus.py [width] [depth] [long_range_columns=4] [long_range_rows=4] [sdrp=0.1464466]")
+        raise RuntimeError("Usage: python3 nn_qab_half_torus.py [width] [depth] [long_range_columns=4] [long_range_rows=4] [sdrp=2**-24]")
     width = int(sys.argv[1])
     depth = int(sys.argv[2])
     lrc = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     lrr = int(sys.argv[4]) if len(sys.argv) > 4 else 4
-    sdrp  = float(sys.argv[5]) if len(sys.argv) > 5 else ((1 - 1 / math.sqrt(2)) / 2)
+    sdrp  = float(sys.argv[5]) if len(sys.argv) > 5 else (2 ** -24)
     result = bench_qrack(width, depth, lrc, lrr, sdrp)
     for k, v in result.items():
         print(f"  {k}: {v}")

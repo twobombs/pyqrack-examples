@@ -85,32 +85,6 @@ def nswap(sim, q1, q2):
 
 
 # ---------------------------------------------------------------------------
-# Statistics
-# ---------------------------------------------------------------------------
-
-def calc_stats(ideal_probs, counts, shots):
-    n_pow = len(ideal_probs)
-    threshold = statistics.median(ideal_probs)
-    u_u = statistics.mean(ideal_probs)
-    numer = 0
-    denom = 0
-    hog_prob = 0
-    for b in range(n_pow):
-        ideal = ideal_probs[b]
-        patch = (counts.get(b, 0) / shots)
-
-        ideal_centered = ideal - u_u
-        denom += ideal_centered * ideal_centered
-        numer += ideal_centered * (patch - u_u)
-
-        if ideal > threshold:
-            hog_prob += patch
-
-    xeb = numer / denom
-    return xeb, hog_prob
-
-
-# ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
 
@@ -205,6 +179,8 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
                 g = random.choice(two_bit_gates)
                 g(qc, b1, b2)
 
+    qc = qc & qc.inverse()
+
     # -----------------------------------------------------------------------
     # Method: QrackAceBackend
     # -----------------------------------------------------------------------
@@ -212,22 +188,13 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
     sim.set_sdrp(sdrp)
     sim.run_qiskit_circuit(qc, shots=0)
     ace_counts = dict(Counter(sim.measure_shots(all_bits, shots)))
+    hamming = 0
+    for s, count in ace_counts.items():
+        hamming += s.bit_count() * count
+    hamming /= shots
 
     t_ace = time.perf_counter()
     print(f"ace_seconds: {t_ace - t_circ:.4f}")
-
-    # -----------------------------------------------------------------------
-    # Ideal ground truth via QrackSimulator
-    # -----------------------------------------------------------------------
-    sim_ideal = QrackSimulator(width)
-    sim_ideal.run_qiskit_circuit(qc, shots=0)
-    ideal_probs = np.asarray(sim_ideal.out_probs(), dtype=np.float64)
-    del sim_ideal
-
-    t_ideal = time.perf_counter()
-    print(f"ideal_seconds: {t_ideal - t_ace:.4f}")
-
-    xeb_ace, hog_ace = calc_stats(ideal_probs, ace_counts, shots)
 
     return {
         "width":              width,
@@ -236,8 +203,8 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
         "long_range_rows":    lrr,
         "sdrp":               sdrp,
         "depth":              depth,
-        "xeb_ace":            xeb_ace,
-        "hog_ace":            hog_ace,
+        "fidelity_ace":       ace_counts.get(0, 0) / shots,
+        "hamming_weight_ace": hamming,
     }
 
 
