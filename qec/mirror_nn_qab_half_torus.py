@@ -203,7 +203,7 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
         "long_range_rows":    lrr,
         "sdrp":               sdrp,
         "depth":              depth,
-        "fidelity_ace":       ace_counts.get(0, 0),
+        "fidelity_ace":       ace_counts.get(0, 0) / shots,
         "hamming_weight_ace": hamming,
     }
 
