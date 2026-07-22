@@ -257,7 +257,7 @@ def bench_qrack(width, depth, lrc=4, lrr=4, sdrp=0.0):
 
 def main():
     if len(sys.argv) < 3:
-        raise RuntimeError("Usage: python3 nn_qab_half_torus.py [width] [depth] [long_range_columns=4] [long_range_rows=4] [sdrp=0.1464466]")
+        raise RuntimeError("Usage: python3 nn_qab_half_torus.py [width] [depth] [long_range_columns=4] [long_range_rows=4] [sdrp=2**-24]")
     width = int(sys.argv[1])
     depth = int(sys.argv[2])
     lrc = int(sys.argv[3]) if len(sys.argv) > 3 else 4
